@@ -684,7 +684,14 @@ function Start-FakeStoreServer {
     $l.Start()
     $Store.Listener = $l
     while ($l.IsListening) {
-      try { $ctx = $l.GetContext() } catch { break }
+      # BeginGetContext and short waits, not GetContext: on Windows a
+      # blocking GetContext is at times not released by Stop and Close
+      # (seen on windows-latest), so the job never ended. This loop looks
+      # at IsListening every 100 ms and ends once the listener is stopped.
+      try { $wait = $l.BeginGetContext($null, $null) } catch { break }
+      while (-not $wait.AsyncWaitHandle.WaitOne(100) -and $l.IsListening) { }
+      if (-not $wait.IsCompleted) { break }
+      try { $ctx = $l.EndGetContext($wait) } catch { break }
       $hold = $false
       try {
         $h = @{}
@@ -756,7 +763,13 @@ function Stop-FakeStoreServer {
     if ($Store.Listener -is [System.Net.Sockets.TcpListener]) { if ($Store.ContainsKey('Conn') -and $Store.Conn) { try { $Store.Conn.Close() } catch { } } }
     else { $Store.Listener.Close() }
   }
-  if ($Store.ContainsKey('Job')) { $Store.Job | Wait-Job -Timeout 10 | Out-Null; $Store.Job | Remove-Job -Force }
+  if ($Store.ContainsKey('Job')) {
+    # A job still running after 10 s fails the test instead of being removed:
+    # Remove-Job -Force waits for its thread, and a thread blocked in a .NET
+    # call never gets there, so the whole run would hang.
+    if (-not ($Store.Job | Wait-Job -Timeout 10)) { throw "the fake Store server job did not end within 10 s of the stop (left running)" }
+    $Store.Job | Remove-Job -Force
+  }
 }
 
 # Entry names and bytes of the uploaded zip.
