@@ -1,0 +1,258 @@
+name: Microsoft Store submission (by submission id)
+description: >-
+  Publish an .msixupload to the Microsoft Store through the Store submission
+  API: create, upload, field compare, commit and read back, always by the id
+  of the submission this run created. Also inspect, read-only diagnose and
+  delete-draft modes.
+author: JerisHQ
+branding:
+  icon: upload-cloud
+  color: blue
+
+# Every input reaches the step scripts through env only, never through an
+# expression inside a run: script (checked by scripts/tests/Action.Tests.ps1).
+inputs:
+  mode:
+    description: 'inspect | publish | diagnose | delete-draft'
+    required: true
+  product-id:
+    description: 'Store ID of the app (Partner Center, Product identity). Needed by publish, diagnose and delete-draft.'
+    required: false
+    default: ''
+  package-dir:
+    description: 'Directory that holds exactly one .msixupload (inspect, publish).'
+    required: false
+    default: ''
+  identity-name:
+    description: 'Expected Identity Name in the AppxManifest (inspect, publish).'
+    required: false
+    default: ''
+  publisher:
+    description: 'Expected Identity Publisher in the AppxManifest, for example CN=... (inspect, publish).'
+    required: false
+    default: ''
+  version:
+    description: 'Optional expected package version (a.b.c.0). Empty: any version ending in .0 is accepted.'
+    required: false
+    default: ''
+  expected-file-name:
+    description: 'publish: the file name an earlier inspect run showed. The publish stops unless the package has this name.'
+    required: false
+    default: ''
+  expected-sha256:
+    description: 'publish: the SHA-256 an earlier inspect run showed. The publish stops unless the package has this hash.'
+    required: false
+    default: ''
+  submission-id:
+    description: 'diagnose and delete-draft: the submission id (digits only).'
+    required: false
+    default: ''
+  tenant-id:
+    description: 'Entra tenant id of the Partner Center app registration. Pass a secret.'
+    required: false
+    default: ''
+  client-id:
+    description: 'Client (application) id of that app registration. Pass a secret.'
+    required: false
+    default: ''
+  client-secret:
+    description: 'Client secret of that app registration. Pass a secret.'
+    required: false
+    default: ''
+  submit-minutes:
+    description: 'publish: deadline of the create, upload, check and commit step, in minutes (8-120). No Store call waits past it.'
+    required: false
+    default: '18'
+  read-back-minutes:
+    description: 'publish: how long the read-back of the committed submission keeps trying, in minutes (0-240).'
+    required: false
+    default: '30'
+  read-back-interval-seconds:
+    description: 'publish: seconds between read-back attempts (5-600).'
+    required: false
+    default: '60'
+  delete-minutes:
+    description: 'delete-draft: deadline of the delete-draft step, in minutes (1-30).'
+    required: false
+    default: '4'
+
+outputs:
+  file-name:
+    description: 'inspect, publish: file name of the .msixupload.'
+    value: ${{ steps.package.outputs.file_name }}
+  version:
+    description: 'inspect, publish: Identity Version from the AppxManifest.'
+    value: ${{ steps.package.outputs.version }}
+  sha256:
+    description: 'inspect, publish: SHA-256 of the .msixupload (lower case hex).'
+    value: ${{ steps.package.outputs.sha256 }}
+  submission-id:
+    description: 'publish: id of the submission this run created and committed.'
+    value: ${{ steps.submit.outputs.submission_id }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check the inputs
+      id: check
+      shell: pwsh
+      env:
+        MODE: ${{ inputs.mode }}
+        STORE_PRODUCT_ID: ${{ inputs.product-id }}
+        PACKAGE_DIR: ${{ inputs.package-dir }}
+        EXPECTED_IDENTITY_NAME: ${{ inputs.identity-name }}
+        EXPECTED_PUBLISHER: ${{ inputs.publisher }}
+        PC_TENANT_ID: ${{ inputs.tenant-id }}
+        PC_CLIENT_ID: ${{ inputs.client-id }}
+        PC_CLIENT_SECRET: ${{ inputs.client-secret }}
+        SUBMIT_MINUTES: ${{ inputs.submit-minutes }}
+        READ_BACK_MINUTES: ${{ inputs.read-back-minutes }}
+        READ_BACK_INTERVAL_SECONDS: ${{ inputs.read-back-interval-seconds }}
+        DELETE_MINUTES: ${{ inputs.delete-minutes }}
+      run: |
+        # Checks presence and shape only; values are never printed.
+        $modes = 'inspect', 'publish', 'diagnose', 'delete-draft'
+        if ($env:MODE -cnotin $modes) { throw "mode must be one of: $($modes -join ', ')" }
+        function Assert-Minutes([string]$Name, [string]$Value, [int]$Min, [int]$Max) {
+          if ($Value -cnotmatch '^[0-9]{1,4}\z' -or [int]$Value -lt $Min -or [int]$Value -gt $Max) { throw "$Name must be a whole number from $Min to $Max" }
+        }
+        Assert-Minutes 'submit-minutes' $env:SUBMIT_MINUTES 8 120
+        Assert-Minutes 'read-back-minutes' $env:READ_BACK_MINUTES 0 240
+        Assert-Minutes 'read-back-interval-seconds' $env:READ_BACK_INTERVAL_SECONDS 5 600
+        Assert-Minutes 'delete-minutes' $env:DELETE_MINUTES 1 30
+        if ($env:MODE -cin 'inspect', 'publish') {
+          if (-not $env:PACKAGE_DIR -or -not $env:EXPECTED_IDENTITY_NAME -or -not $env:EXPECTED_PUBLISHER) {
+            throw "mode=$env:MODE needs package-dir, identity-name and publisher"
+          }
+        }
+        if ($env:MODE -cne 'inspect') {
+          if (-not $env:STORE_PRODUCT_ID) { throw "mode=$env:MODE needs product-id" }
+          if (-not $env:PC_TENANT_ID -or -not $env:PC_CLIENT_ID -or -not $env:PC_CLIENT_SECRET) {
+            throw "mode=$env:MODE needs tenant-id, client-id and client-secret (pass them from secrets)"
+          }
+        }
+
+    - name: Check the package identity and version
+      id: package
+      if: inputs.mode == 'inspect' || inputs.mode == 'publish'
+      shell: pwsh
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        MODE: ${{ inputs.mode }}
+        PACKAGE_DIR: ${{ inputs.package-dir }}
+        EXPECTED_IDENTITY_NAME: ${{ inputs.identity-name }}
+        EXPECTED_PUBLISHER: ${{ inputs.publisher }}
+        EXPECTED_VERSION: ${{ inputs.version }}
+        EXPECTED_FILE: ${{ inputs.expected-file-name }}
+        EXPECTED_SHA256: ${{ inputs.expected-sha256 }}
+      run: |
+        Import-Module (Join-Path $env:ACTION_PATH 'scripts' 'MsStoreRunner.psm1')
+        $p = Get-StorePackage -Dir $env:PACKAGE_DIR -ExpectedName $env:EXPECTED_IDENTITY_NAME `
+          -ExpectedPublisher $env:EXPECTED_PUBLISHER -ExpectedVersion $env:EXPECTED_VERSION
+        if ($env:MODE -ceq 'publish') {
+          # The package an earlier inspect run showed (to an approver), when given.
+          if ($env:EXPECTED_FILE -and $p.FileName -cne $env:EXPECTED_FILE) { throw "package file $($p.FileName) is not the one shown before approval ($env:EXPECTED_FILE)" }
+          if ($env:EXPECTED_SHA256 -and $p.Sha256 -ne $env:EXPECTED_SHA256) { throw 'package SHA-256 differs from the one shown before approval' }
+          Write-Host "Publishing $($p.FileName) Version=$($p.Version) SHA256=$($p.Sha256)"
+        } else {
+          @(
+            '### Store package'
+            ''
+            "- File: ``$($p.FileName)``"
+            "- Version: ``$($p.Version)``"
+            "- SHA-256: ``$($p.Sha256)``"
+          ) -join "`n" >> $env:GITHUB_STEP_SUMMARY
+        }
+        "file=$($p.Path)" >> $env:GITHUB_OUTPUT
+        "file_name=$($p.FileName)" >> $env:GITHUB_OUTPUT
+        "version=$($p.Version)" >> $env:GITHUB_OUTPUT
+        "sha256=$($p.Sha256)" >> $env:GITHUB_OUTPUT
+
+    - name: Create the submission, upload, check and commit it (by submission id)
+      id: submit
+      if: inputs.mode == 'publish'
+      shell: pwsh
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        SUBMIT_MINUTES: ${{ inputs.submit-minutes }}
+        STORE_PRODUCT_ID: ${{ inputs.product-id }}
+        PKG_FILE: ${{ steps.package.outputs.file }}
+        PKG_NAME: ${{ steps.package.outputs.file_name }}
+        EXPECTED_VERSION: ${{ steps.package.outputs.version }}
+        PC_TENANT_ID: ${{ inputs.tenant-id }}
+        PC_CLIENT_ID: ${{ inputs.client-id }}
+        PC_CLIENT_SECRET: ${{ inputs.client-secret }}
+      run: |
+        # No call waits past this deadline (submit-minutes from now), so the
+        # result and the submission id are printed before the caller's step
+        # timeout, which must leave room for it (see README, Timeouts).
+        $deadline = [DateTime]::UtcNow.AddMinutes([int]$env:SUBMIT_MINUTES)
+        Import-Module (Join-Path $env:ACTION_PATH 'scripts' 'MsStoreRunner.psm1')
+        Connect-StoreApi -TenantId $env:PC_TENANT_ID -ClientId $env:PC_CLIENT_ID -ClientSecret $env:PC_CLIENT_SECRET
+        $id = Publish-StoreSubmission -ProductId $env:STORE_PRODUCT_ID -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION -DeadlineUtc $deadline
+        if ($id -isnot [string] -or $id -cnotmatch '^[0-9]{1,20}\z') { throw 'submission id is not a number' }
+        "submission_id=$id" >> $env:GITHUB_OUTPUT
+
+    - name: Read the submission back by its id and fail unless it holds the new package
+      id: read-back
+      if: inputs.mode == 'publish'
+      shell: pwsh
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        READ_BACK_MINUTES: ${{ inputs.read-back-minutes }}
+        READ_BACK_INTERVAL_SECONDS: ${{ inputs.read-back-interval-seconds }}
+        STORE_PRODUCT_ID: ${{ inputs.product-id }}
+        SUBMISSION_ID: ${{ steps.submit.outputs.submission_id }}
+        PKG_NAME: ${{ steps.package.outputs.file_name }}
+        EXPECTED_VERSION: ${{ steps.package.outputs.version }}
+        PC_TENANT_ID: ${{ inputs.tenant-id }}
+        PC_CLIENT_ID: ${{ inputs.client-id }}
+        PC_CLIENT_SECRET: ${{ inputs.client-secret }}
+      run: |
+        # The log prints a package's file name only when it is exactly PKG_NAME.
+        Import-Module (Join-Path $env:ACTION_PATH 'scripts' 'MsStoreRunner.psm1')
+        Connect-StoreApi -TenantId $env:PC_TENANT_ID -ClientId $env:PC_CLIENT_ID -ClientSecret $env:PC_CLIENT_SECRET
+        Assert-SubmissionHasPackage -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID -ExpectedVersion $env:EXPECTED_VERSION -ExpectedFileName $env:PKG_NAME -TimeoutMinutes ([int]$env:READ_BACK_MINUTES) -IntervalSeconds ([int]$env:READ_BACK_INTERVAL_SECONDS)
+
+    - name: Read the submission and the last published one (GET calls only) and print which fields differ, by path, never values
+      id: diagnose
+      if: inputs.mode == 'diagnose'
+      shell: pwsh
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        STORE_PRODUCT_ID: ${{ inputs.product-id }}
+        SUBMISSION_ID: ${{ inputs.submission-id }}
+        PC_TENANT_ID: ${{ inputs.tenant-id }}
+        PC_CLIENT_ID: ${{ inputs.client-id }}
+        PC_CLIENT_SECRET: ${{ inputs.client-secret }}
+      run: |
+        # The id is checked before the sign-in. While it runs,
+        # Show-StoreSubmissionDiagnosis refuses any call but a GET to the
+        # Store API, before it is sent.
+        if ($env:SUBMISSION_ID -cnotmatch '^[0-9]{1,20}\z') { throw 'submission-id must be a number' }
+        Import-Module (Join-Path $env:ACTION_PATH 'scripts' 'MsStoreRunner.psm1')
+        Connect-StoreApi -TenantId $env:PC_TENANT_ID -ClientId $env:PC_CLIENT_ID -ClientSecret $env:PC_CLIENT_SECRET
+        Show-StoreSubmissionDiagnosis -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID
+
+    - name: Delete that one uncommitted draft by id (only while it is the app's pending PendingCommit draft), then check it is gone
+      id: delete-draft
+      if: inputs.mode == 'delete-draft'
+      shell: pwsh
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        DELETE_MINUTES: ${{ inputs.delete-minutes }}
+        STORE_PRODUCT_ID: ${{ inputs.product-id }}
+        SUBMISSION_ID: ${{ inputs.submission-id }}
+        PC_TENANT_ID: ${{ inputs.tenant-id }}
+        PC_CLIENT_ID: ${{ inputs.client-id }}
+        PC_CLIENT_SECRET: ${{ inputs.client-secret }}
+      run: |
+        # No call waits past this deadline (delete-minutes from now). The id
+        # is checked before the sign-in. While it runs,
+        # Remove-StorePendingDraft refuses any call but a GET to the Store API
+        # and one DELETE of that submission, before it is sent.
+        $deadline = [DateTime]::UtcNow.AddMinutes([int]$env:DELETE_MINUTES)
+        if ($env:SUBMISSION_ID -cnotmatch '^[0-9]{1,20}\z') { throw 'submission-id must be a number' }
+        Import-Module (Join-Path $env:ACTION_PATH 'scripts' 'MsStoreRunner.psm1')
+        Connect-StoreApi -TenantId $env:PC_TENANT_ID -ClientId $env:PC_CLIENT_ID -ClientSecret $env:PC_CLIENT_SECRET
+        Remove-StorePendingDraft -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID -DeadlineUtc $deadline

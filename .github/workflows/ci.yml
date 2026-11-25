@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pester:
+    # Unit tests and the fake Store over HTTP on 127.0.0.1 (scripts/tests).
+    # No secrets; nothing reaches Partner Center or the Store.
+    name: Pester (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run Pester
+        run: |
+          $pester = Get-Module -ListAvailable Pester | Where-Object { $_.Version -eq [version]'5.7.1' } | Select-Object -First 1
+          if (-not $pester) {
+            Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force -SkipPublisherCheck
+            $pester = Get-Module -ListAvailable Pester | Where-Object { $_.Version -eq [version]'5.7.1' } | Select-Object -First 1
+          }
+          Import-Module $pester.Path -Force
+          Write-Host "PowerShell $($PSVersionTable.PSVersion), Pester $($pester.Version)"
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = 'scripts/tests'
+          $cfg.Run.PassThru = $true
+          $cfg.Output.Verbosity = 'Detailed'
+          $r = Invoke-Pester -Configuration $cfg
+          if ($r.Result -ne 'Passed' -or $r.PassedCount -lt 1) { throw "Pester: $($r.Result), $($r.FailedCount) failed, $($r.PassedCount) passed" }
+
+  action:
+    # The action itself (uses: ./) on a runner: mode=inspect on a generated
+    # fake package, and a Store mode without credentials, which must stop in
+    # the check step before any sign-in.
+    name: Action self-test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Make a fake .msixupload
+        id: make
+        run: |
+          $p = ./scripts/tests/New-TestMsixUpload.ps1 -Dir (Join-Path $env:RUNNER_TEMP 'pkg') -Version '1.2.3.0'
+          "sha256=$((Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLower())" >> $env:GITHUB_OUTPUT
+
+      - name: Inspect it with the action
+        id: inspect
+        uses: ./
+        with:
+          mode: inspect
+          package-dir: ${{ runner.temp }}/pkg
+          identity-name: Contoso.ExampleApp
+          publisher: CN=00000000-0000-0000-0000-000000000000
+          version: 1.2.3.0
+
+      - name: Check the inspect outputs
+        env:
+          FILE_NAME: ${{ steps.inspect.outputs.file-name }}
+          VERSION: ${{ steps.inspect.outputs.version }}
+          SHA256: ${{ steps.inspect.outputs.sha256 }}
+          WANT_SHA256: ${{ steps.make.outputs.sha256 }}
+          SUBMISSION_ID: ${{ steps.inspect.outputs.submission-id }}
+        run: |
+          if ($env:FILE_NAME -cne 'ExampleApp-1.2.3.0-x64.msixupload') { throw "file-name output is '$env:FILE_NAME'" }
+          if ($env:VERSION -cne '1.2.3.0') { throw "version output is '$env:VERSION'" }
+          if ($env:SHA256 -cnotmatch '^[0-9a-f]{64}\z' -or $env:SHA256 -cne $env:WANT_SHA256) { throw "sha256 output is '$env:SHA256', want '$env:WANT_SHA256'" }
+          if ($env:SUBMISSION_ID) { throw 'inspect must not set submission-id' }
+          Write-Host "inspect outputs: $env:FILE_NAME $env:VERSION $env:SHA256"
+
+      - name: A Store mode without credentials (must fail)
+        id: no-creds
+        continue-on-error: true
+        uses: ./
+        with:
+          mode: diagnose
+          product-id: 9TESTAPP0001
+          submission-id: '1234567890'
+
+      - name: Check that it failed
+        env:
+          OUTCOME: ${{ steps.no-creds.outcome }}
+        run: |
+          if ($env:OUTCOME -cne 'failure') { throw "a diagnose without credentials ended with '$env:OUTCOME', not failure" }
+          Write-Host 'a diagnose without credentials failed, as it must'
