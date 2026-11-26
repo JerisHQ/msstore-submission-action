@@ -28,5 +28,14 @@ $stop = if ($env:GITHUB_ACTIONS -ceq 'true') { [guid]::NewGuid().ToString('N') }
 if ($stop) { Write-Host "::stop-commands::$stop" }
 try { $r = Invoke-Pester -Configuration $cfg }
 finally { if ($stop) { Write-Host "::$($stop)::" } }
+if ($stop) {
+  # Pester's own failure annotations were not read while commands were
+  # stopped: write them again, with line breaks and command text made inert.
+  $failed = @($r.FailedContainers | ForEach-Object { "$($_.Item)" }) + @(@($r.FailedBlocks) + @($r.Failed) | ForEach-Object { $_.ExpandedPath })
+  foreach ($f in $failed) {
+    $t = $f -replace '[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+', ' ' -replace ':{2,}', ':' -replace '#{2,}\[', '#[' -replace '%', '%25'
+    Write-Host "::error title=Pester failed::$t"
+  }
+}
 Write-Host "Pester: $($r.PassedCount) passed, $($r.FailedCount) failed, $($r.SkippedCount) skipped, $($r.NotRunCount) not run"
 if ($r.Result -ne 'Passed' -or $r.PassedCount -lt 1) { throw "Pester: $($r.Result), $($r.FailedCount) failed, $($r.PassedCount) passed" }
