@@ -21,6 +21,12 @@ $cfg = New-PesterConfiguration
 $cfg.Run.Path = $PSScriptRoot
 $cfg.Run.PassThru = $true
 $cfg.Output.Verbosity = 'Detailed'
-$r = Invoke-Pester -Configuration $cfg
+# Test names and test output hold workflow command text on purpose, so on
+# GitHub Actions the runner stops reading commands while Pester prints and
+# resumes on a one-time token.
+$stop = if ($env:GITHUB_ACTIONS -ceq 'true') { [guid]::NewGuid().ToString('N') }
+if ($stop) { Write-Host "::stop-commands::$stop" }
+try { $r = Invoke-Pester -Configuration $cfg }
+finally { if ($stop) { Write-Host "::$($stop)::" } }
 Write-Host "Pester: $($r.PassedCount) passed, $($r.FailedCount) failed, $($r.SkippedCount) skipped, $($r.NotRunCount) not run"
 if ($r.Result -ne 'Passed' -or $r.PassedCount -lt 1) { throw "Pester: $($r.Result), $($r.FailedCount) failed, $($r.PassedCount) passed" }

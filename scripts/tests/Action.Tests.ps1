@@ -251,7 +251,7 @@ Describe 'action.yml package step' {
     @(Get-ChildItem -LiteralPath $Tmp).Count | Should -Be 0 -Because 'a refused package leaves no copy'
   }
   It 'writes no output when the file name holds <Case>' -ForEach @(
-    @{ Case = '##[set-output]'; Name = '##[set-output name=file]evil-x64.msixupload'; Unix = $false }
+    @{ Case = 'a legacy set-output command'; Name = '##[set-output name=file]evil-x64.msixupload'; Unix = $false }
     @{ Case = '::add-mask::'; Name = 'Example::add-mask::x-x64.msixupload'; Unix = $true }
     @{ Case = 'a line feed and ::set-output'; Name = "Example`n::set-output name=file::evil.msixupload"; Unix = $true }
     @{ Case = 'a carriage return'; Name = "Example`r::error::x.msixupload"; Unix = $true }
