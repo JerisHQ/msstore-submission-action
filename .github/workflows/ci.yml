@@ -29,20 +29,42 @@ jobs:
           persist-credentials: false
 
       - name: Run Pester
+        run: ./scripts/tests/Invoke-CiPester.ps1
+
+  pester-pwsh77:
+    # The same tests on PowerShell 7.7.0 (.NET 11), from the PowerShell
+    # release, checked against its SHA-256 before it runs. On .NET 11
+    # DecompressionMethods.All adds zstd; the module names gzip, deflate and
+    # br itself, and the HTTP tests check the header it sends.
+    name: Pester (ubuntu-latest, PowerShell 7.7.0)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install PowerShell 7.7.0
+        id: pwsh
+        shell: bash
+        env:
+          PWSH_URL: https://github.com/PowerShell/PowerShell/releases/download/v7.7.0/powershell-7.7.0-linux-x64.tar.gz
+          PWSH_SHA256: c89d9c682d2c403dfe726f3df948e359675235a5bd6fab535776de69729ca0cb
         run: |
-          $pester = Get-Module -ListAvailable Pester | Where-Object { $_.Version -eq [version]'5.7.1' } | Select-Object -First 1
-          if (-not $pester) {
-            Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force -SkipPublisherCheck
-            $pester = Get-Module -ListAvailable Pester | Where-Object { $_.Version -eq [version]'5.7.1' } | Select-Object -First 1
-          }
-          Import-Module $pester.Path -Force
-          Write-Host "PowerShell $($PSVersionTable.PSVersion), Pester $($pester.Version)"
-          $cfg = New-PesterConfiguration
-          $cfg.Run.Path = 'scripts/tests'
-          $cfg.Run.PassThru = $true
-          $cfg.Output.Verbosity = 'Detailed'
-          $r = Invoke-Pester -Configuration $cfg
-          if ($r.Result -ne 'Passed' -or $r.PassedCount -lt 1) { throw "Pester: $($r.Result), $($r.FailedCount) failed, $($r.PassedCount) passed" }
+          set -euo pipefail
+          dir="$RUNNER_TEMP/pwsh-7.7.0"
+          mkdir -p "$dir"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/pwsh-7.7.0.tar.gz" "$PWSH_URL"
+          echo "$PWSH_SHA256  $RUNNER_TEMP/pwsh-7.7.0.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/pwsh-7.7.0.tar.gz" -C "$dir"
+          chmod +x "$dir/pwsh"
+          echo "exe=$dir/pwsh" >> "$GITHUB_OUTPUT"
+
+      - name: Run Pester on PowerShell 7.7.0
+        shell: bash
+        env:
+          PWSH: ${{ steps.pwsh.outputs.exe }}
+        run: '"$PWSH" -NoProfile -NonInteractive -File ./scripts/tests/Invoke-CiPester.ps1 -PowerShellVersion 7.7.0'
 
   action:
     # The action itself (uses: ./) on a runner: mode=inspect on a generated

@@ -151,9 +151,15 @@ runs:
           -ExpectedPublisher $env:EXPECTED_PUBLISHER -ExpectedVersion $env:EXPECTED_VERSION
         if ($env:MODE -ceq 'publish') {
           # The package an earlier inspect run showed (to an approver), when given.
-          if ($env:EXPECTED_FILE -and $p.FileName -cne $env:EXPECTED_FILE) { throw "package file $($p.FileName) is not the one shown before approval ($env:EXPECTED_FILE)" }
+          if ($env:EXPECTED_FILE -and $p.FileName -cne $env:EXPECTED_FILE) { throw (Protect-WorkflowCommand "package file $($p.FileName) is not the one shown before approval ($env:EXPECTED_FILE)") }
           if ($env:EXPECTED_SHA256 -and $p.Sha256 -ne $env:EXPECTED_SHA256) { throw 'package SHA-256 differs from the one shown before approval' }
-          Write-Host "Publishing $($p.FileName) Version=$($p.Version) SHA256=$($p.Sha256)"
+        }
+        # Every value is checked before anything is written (no line break or
+        # other control character); file is the checked copy, not the file in
+        # package-dir (Get-StorePackage).
+        Write-StoreStepOutput -Path $env:GITHUB_OUTPUT -Values ([ordered]@{ file = $p.Path; file_name = $p.FileName; version = $p.Version; sha256 = $p.Sha256 })
+        if ($env:MODE -ceq 'publish') {
+          Write-Host (Protect-WorkflowCommand "Publishing $($p.FileName) Version=$($p.Version) SHA256=$($p.Sha256)")
         } else {
           @(
             '### Store package'
@@ -163,10 +169,6 @@ runs:
             "- SHA-256: ``$($p.Sha256)``"
           ) -join "`n" >> $env:GITHUB_STEP_SUMMARY
         }
-        "file=$($p.Path)" >> $env:GITHUB_OUTPUT
-        "file_name=$($p.FileName)" >> $env:GITHUB_OUTPUT
-        "version=$($p.Version)" >> $env:GITHUB_OUTPUT
-        "sha256=$($p.Sha256)" >> $env:GITHUB_OUTPUT
 
     - name: Create the submission, upload, check and commit it (by submission id)
       id: submit
@@ -179,6 +181,7 @@ runs:
         PKG_FILE: ${{ steps.package.outputs.file }}
         PKG_NAME: ${{ steps.package.outputs.file_name }}
         EXPECTED_VERSION: ${{ steps.package.outputs.version }}
+        EXPECTED_SHA256: ${{ steps.package.outputs.sha256 }}
         PC_TENANT_ID: ${{ inputs.tenant-id }}
         PC_CLIENT_ID: ${{ inputs.client-id }}
         PC_CLIENT_SECRET: ${{ inputs.client-secret }}
@@ -189,7 +192,7 @@ runs:
         $deadline = [DateTime]::UtcNow.AddMinutes([int]$env:SUBMIT_MINUTES)
         Import-Module (Join-Path $env:ACTION_PATH 'scripts' 'MsStoreRunner.psm1')
         Connect-StoreApi -TenantId $env:PC_TENANT_ID -ClientId $env:PC_CLIENT_ID -ClientSecret $env:PC_CLIENT_SECRET
-        $id = Publish-StoreSubmission -ProductId $env:STORE_PRODUCT_ID -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION -DeadlineUtc $deadline
+        $id = Publish-StoreSubmission -ProductId $env:STORE_PRODUCT_ID -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION -ExpectedSha256 $env:EXPECTED_SHA256 -DeadlineUtc $deadline
         if ($id -isnot [string] -or $id -cnotmatch '^[0-9]{1,20}\z') { throw 'submission id is not a number' }
         "submission_id=$id" >> $env:GITHUB_OUTPUT
 

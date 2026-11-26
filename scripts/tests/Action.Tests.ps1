@@ -131,6 +131,8 @@ Describe 'action.yml (static checks)' {
     $s = Get-ActionStepEnv 'submit'
     $s['PKG_FILE'] | Should -BeExactly '${{ steps.package.outputs.file }}'
     $s['EXPECTED_VERSION'] | Should -BeExactly '${{ steps.package.outputs.version }}'
+    $s['EXPECTED_SHA256'] | Should -BeExactly '${{ steps.package.outputs.sha256 }}'
+    Get-ActionStepScript 'submit' | Should -Match ' -ExpectedSha256 \$env:EXPECTED_SHA256 '
     Get-ActionStepScript 'read-back' | Should -Match 'Assert-SubmissionHasPackage -ProductId \$env:STORE_PRODUCT_ID -SubmissionId \$env:SUBMISSION_ID '
   }
   It 'checks the submission id before the sign-in in step <Id>' -ForEach @(@{ Id = 'diagnose' }, @{ Id = 'delete-draft' }) {
@@ -181,15 +183,32 @@ Describe 'action.yml package step' {
     $script:Dir = Join-Path ([IO.Path]::GetTempPath()) ('pkgdir-' + [guid]::NewGuid().ToString('N'))
     $script:PkgPath = & $MakePackage -Dir $Dir -Version '1.2.3.0'
     $script:Sha = (Get-FileHash -LiteralPath $PkgPath -Algorithm SHA256).Hash.ToLower()
+    # The runner's temp folder, where the step keeps its copy of the package.
+    $script:Tmp = Join-Path ([IO.Path]::GetTempPath()) ('runner-temp-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory $Tmp | Out-Null
+    $script:CopyPattern = '^file=' + [regex]::Escape($Tmp) + '[/\\]msstore-package-[0-9a-f]{32}[/\\]ExampleApp-1\.2\.3\.0-x64\.msixupload$'
     $script:Base = @{ MODE = 'inspect'; PACKAGE_DIR = $Dir; EXPECTED_IDENTITY_NAME = $Identity; EXPECTED_PUBLISHER = $Publisher
-      EXPECTED_VERSION = ''; EXPECTED_FILE = ''; EXPECTED_SHA256 = '' }
+      EXPECTED_VERSION = ''; EXPECTED_FILE = ''; EXPECTED_SHA256 = ''; RUNNER_TEMP = $Tmp }
   }
-  AfterEach { Remove-Item -LiteralPath $Dir -Recurse -Force -ErrorAction SilentlyContinue }
+  AfterEach { Remove-Item -LiteralPath $Dir, $Tmp -Recurse -Force -ErrorAction SilentlyContinue }
 
-  It 'inspect writes the file, name, version and SHA-256 to the outputs and the job summary' {
+  # A step's output is a line in a file that every later step reads; package
+  # text in a log line could be a workflow command ("::cmd::" at the start of a
+  # line, "##[cmd]" anywhere). Every line the step writes or prints is checked.
+  function script:Assert-NoWorkflowCommand($r) {
+    foreach ($l in @($r.Output) + @(($r.Out + "`n" + $r.Err) -split '\r\n|\r|\n')) {
+      $l | Should -Not -Match '^\s*::' -Because 'no line may start a workflow command'
+      $l | Should -Not -Match '##\[' -Because 'no line may hold a legacy workflow command'
+      $l | Should -Not -Match '::(set-output|add-mask|error|warning|stop-commands)' -Because 'no command text is left as it was'
+    }
+  }
+
+  It 'inspect writes the checked copy, name, version and SHA-256 to the outputs and the job summary' {
     $r = Invoke-Step 'package' $Base
     $r.Err | Should -BeNullOrEmpty
-    $r.Output | Should -Be @("file=$PkgPath", 'file_name=ExampleApp-1.2.3.0-x64.msixupload', 'version=1.2.3.0', "sha256=$Sha")
+    $r.Output.Count | Should -Be 4
+    $r.Output[0] | Should -Match $CopyPattern
+    $r.Output[1..3] | Should -Be @('file_name=ExampleApp-1.2.3.0-x64.msixupload', 'version=1.2.3.0', "sha256=$Sha")
     $r.Summary | Should -Match ([regex]::Escape("- SHA-256: ``$Sha``"))
     $r.Summary | Should -Match ([regex]::Escape('- Version: `1.2.3.0`'))
   }
@@ -198,8 +217,95 @@ Describe 'action.yml package step' {
     $r = Invoke-Step 'package' $e
     $r.Err | Should -BeNullOrEmpty
     $r.Out | Should -Match ([regex]::Escape("Publishing ExampleApp-1.2.3.0-x64.msixupload Version=1.2.3.0 SHA256=$Sha"))
-    $r.Output[0] | Should -BeExactly "file=$PkgPath"
+    $r.Output[0] | Should -Match $CopyPattern
     $r.Summary | Should -BeNullOrEmpty
+  }
+  It 'outputs a read-only copy of the package; replacing the original after the check does not change it' {
+    $r = Invoke-Step 'package' $Base
+    $r.Err | Should -BeNullOrEmpty
+    $copy = $r.Output[0].Substring(5)
+    $copy | Should -Not -Be $PkgPath
+    (Get-Item -LiteralPath $copy).IsReadOnly | Should -BeTrue
+    (Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash.ToLower() | Should -Be $Sha
+    # Another package under the same name, put in package-dir after the check.
+    Remove-Item -LiteralPath $PkgPath
+    $null = & $MakePackage -Dir $Dir -Version '1.2.3.0' -Name 'Contoso.OtherApp'
+    (Get-FileHash -LiteralPath $PkgPath -Algorithm SHA256).Hash.ToLower() | Should -Not -Be $Sha
+    (Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash.ToLower() | Should -Be $Sha
+  }
+  It 'writes no output when the manifest Identity <Field> holds <Case>' -ForEach @(
+    @{ Field = 'Name'; Case = 'a line feed and ::set-output'; Value = "Contoso.ExampleApp`n::set-output name=file::/tmp/evil" }
+    @{ Field = 'Publisher'; Case = 'CR LF and ::add-mask'; Value = "CN=00000000-0000-0000-0000-000000000000`r`n::add-mask::x" }
+    @{ Field = 'Version'; Case = 'a line feed and another output'; Value = "1.2.3.0`nsha256=$('0' * 64)" }
+    @{ Field = 'Publisher'; Case = 'NEL (U+0085) and ::warning'; Value = "CN=00000000-0000-0000-0000-000000000000$([char]0x85)::warning::x" }
+    @{ Field = 'Name'; Case = 'U+2028'; Value = "Contoso.ExampleApp$([char]0x2028)::error::x" }
+  ) {
+    Remove-Item -LiteralPath $PkgPath
+    $id = @{ Name = $Identity; Publisher = $Publisher; Version = '1.2.3.0' }; $id[$Field] = $Value
+    $null = & $MakePackage -Dir $Dir -Name $id.Name -Publisher $id.Publisher -Version $id.Version -FileName 'ExampleApp-1.2.3.0-x64.msixupload'
+    $e = $Base.Clone(); $e.EXPECTED_IDENTITY_NAME = $id.Name; $e.EXPECTED_PUBLISHER = $id.Publisher
+    $r = Invoke-Step 'package' $e
+    $r.Err | Should -BeExactly "the manifest Identity $Field holds a line break or another control character"
+    $r.Output | Should -BeNullOrEmpty
+    Assert-NoWorkflowCommand $r
+    @(Get-ChildItem -LiteralPath $Tmp).Count | Should -Be 0 -Because 'a refused package leaves no copy'
+  }
+  It 'writes no output when the file name holds <Case>' -ForEach @(
+    @{ Case = '##[set-output]'; Name = '##[set-output name=file]evil-x64.msixupload'; Unix = $false }
+    @{ Case = '::add-mask::'; Name = 'Example::add-mask::x-x64.msixupload'; Unix = $true }
+    @{ Case = 'a line feed and ::set-output'; Name = "Example`n::set-output name=file::evil.msixupload"; Unix = $true }
+    @{ Case = 'a carriage return'; Name = "Example`r::error::x.msixupload"; Unix = $true }
+  ) {
+    # Windows file names cannot hold ':' or control characters.
+    if ($Unix -and $IsWindows) { Set-ItResult -Skipped -Because 'Windows file names cannot hold this'; return }
+    # Renamed with .NET: PowerShell reads "::" in a path as a provider name.
+    [IO.File]::Move($PkgPath, [IO.Path]::Combine($Dir, $Name))
+    $r = Invoke-Step 'package' $Base
+    $r.Err | Should -BeExactly 'the .msixupload file name holds a line break, another control character or workflow command text'
+    $r.Output | Should -BeNullOrEmpty
+    Assert-NoWorkflowCommand $r
+  }
+  It 'neutralises workflow command text in the package text it prints and throws (<Case>)' -ForEach @(
+    @{ Case = 'Identity Name with ::add-mask:: and ##['; Name = '::add-mask::Contoso.##[set-output name=file]ExampleApp'; Inner = ''; Mode = 'inspect'; File = '' }
+    @{ Case = 'a .msix inside named with ##['; Name = ''; Inner = '##[set-output name=file]evil.msix'; Mode = 'inspect'; File = '' }
+    @{ Case = 'publish given another file name with ##[ and a line break'; Name = ''; Inner = ''; Mode = 'publish'; File = "x`n::set-output name=file::y##[add-mask]z" }
+  ) {
+    $e = $Base.Clone(); $e.MODE = $Mode; $e.EXPECTED_FILE = $File
+    if ($Name) {
+      Remove-Item -LiteralPath $PkgPath
+      $null = & $MakePackage -Dir $Dir -Name $Name -Version '1.2.3.0'
+      $e.EXPECTED_IDENTITY_NAME = $Name
+    }
+    if ($Inner) {
+      $z = [IO.Compression.ZipFile]::Open($PkgPath, [IO.Compression.ZipArchiveMode]::Update)
+      try {
+        $old = @($z.Entries)[0]; $new = $z.CreateEntry($Inner)
+        $a = $old.Open(); $b = $new.Open(); try { $a.CopyTo($b) } finally { $a.Dispose(); $b.Dispose() }
+        $old.Delete()
+      } finally { $z.Dispose() }
+    }
+    $r = Invoke-Step 'package' $e
+    if ($Mode -ceq 'publish') {
+      $r.Err | Should -BeExactly 'package file ExampleApp-1.2.3.0-x64.msixupload is not the one shown before approval (x :set-output name=file:y#[add-mask]z)'
+      $r.Output | Should -BeNullOrEmpty
+    } else {
+      $r.Err | Should -BeNullOrEmpty
+      $r.Output.Count | Should -Be 4
+      $r.Out | Should -Match ([regex]::Escape($(if ($Name) { 'Identity Name=:add-mask:Contoso.#[set-output name=file]ExampleApp ' } else { 'contains #[set-output name=file]evil.msix (' })))
+    }
+    Assert-NoWorkflowCommand $r
+  }
+  It 'stops on a package folder whose name holds a line break and command text, printing it neutralised' {
+    if ($IsWindows) { Set-ItResult -Skipped -Because 'Windows folder names cannot hold a line feed'; return }
+    # No "::" here: PowerShell reads "::" in a path as a provider name, so such
+    # a folder never gets as far as the step's own text.
+    $bad = Join-Path $Tmp "pkgs`n##[error]x`r##[add-mask]y"
+    [void][IO.Directory]::CreateDirectory($bad)
+    $e = $Base.Clone(); $e.PACKAGE_DIR = $bad
+    $r = Invoke-Step 'package' $e
+    $r.Err | Should -Match '^expected exactly one \.msixupload in .*pkgs #\[error\]x #\[add-mask\]y, found 0$'
+    $r.Output | Should -BeNullOrEmpty
+    Assert-NoWorkflowCommand $r
   }
   It 'stops when <Case>' -ForEach @(
     @{ Case = 'the identity name differs'; Set = @{ EXPECTED_IDENTITY_NAME = 'Contoso.OtherApp' }; Err = 'unexpected Identity Name' }

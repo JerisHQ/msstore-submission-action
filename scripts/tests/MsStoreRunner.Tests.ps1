@@ -106,6 +106,9 @@ BeforeAll {
     }
   }
 
+  # SHA-256 of a test package, lower-case hex, as Get-StorePackage returns it.
+  function script:Get-TestSha([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
+
   function script:New-TestPackage {
     $dir = Join-Path ([IO.Path]::GetTempPath()) ('pkg-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory $dir | Out-Null
@@ -122,7 +125,7 @@ BeforeAll {
   # Every publish run through this helper, whatever it ends with, is checked
   # for prices.
   function script:Invoke-Publish([string]$Package) {
-    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Package -ExpectedFileName $File -ExpectedVersion '0.4.1.0' -CommitReadBackAttempts 3 -CommitReadBackIntervalSeconds 0 }
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Package -ExpectedSha256 (Get-TestSha $Package) -ExpectedFileName $File -ExpectedVersion '0.4.1.0' -CommitReadBackAttempts 3 -CommitReadBackIntervalSeconds 0 }
     $r.All | Should -Not -MatchExactly $PriceValues -Because 'a publish run never prints a price'
     $r
   }
@@ -629,7 +632,7 @@ Describe 'Get-StoreErrorText -Detail (listed target and local hint, never the AP
     $s = New-FakeStore -UploadStatus 403 -UploadBody '{"code":"AuthenticationFailed","target":"blob","message":"denied for sig=FAKE+SAS%2FSIGNATURE-0123456789"}'
     Use-FakeStore $s
     $pkg = New-TestPackage
-    try { { Send-StorePackage -UploadUrl 'https://fakeupload.blob.core.windows.net/blob/upload.zip?sv=1&sig=FAKE%2BSAS' -PackagePath $pkg 6>$null } | Should -Throw -ExpectedMessage 'package upload failed: HTTP 403 (AuthenticationFailed)' }
+    try { { Send-StorePackage -UploadUrl 'https://fakeupload.blob.core.windows.net/blob/upload.zip?sv=1&sig=FAKE%2BSAS' -PackagePath $pkg -ExpectedSha256 (Get-TestSha $pkg) 6>$null } | Should -Throw -ExpectedMessage 'package upload failed: HTTP 403 (AuthenticationFailed)' }
     finally { Remove-Item -LiteralPath (Split-Path $pkg) -Recurse -Force }
   }
 }
@@ -722,9 +725,114 @@ Describe 'Strings from the API are printed only when they are plain values' {
   }
 }
 
+# A step output is a name=value line in the file GITHUB_OUTPUT names; a line
+# break in a value would start another line, and so set another output.
+Describe 'Write-StoreStepOutput (step outputs checked before anything is written)' {
+  BeforeEach {
+    $script:OutFile = Join-Path ([IO.Path]::GetTempPath()) ('github-output-' + [guid]::NewGuid().ToString('N'))
+    [IO.File]::WriteAllText($OutFile, "before=1`n")
+  }
+  AfterEach { Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue }
+
+  # Command text in a value is only text in this file (one line, one output);
+  # it is never printed.
+  It 'writes one name=value line per output, in order' {
+    Write-StoreStepOutput -Path $OutFile -Values ([ordered]@{ file = '/tmp/a b/x.msixupload'; sha256 = ('a' * 64); note = '::set-output name=x::y ##[add-mask]z' })
+    [IO.File]::ReadAllText($OutFile) | Should -BeExactly "before=1`nfile=/tmp/a b/x.msixupload`nsha256=$('a' * 64)`nnote=::set-output name=x::y ##[add-mask]z`n"
+  }
+  It 'refuses a value with <Case> and writes no output at all' -ForEach @(
+    @{ Case = 'a line feed (another output)'; Value = "x`nsha256=$('0' * 64)" }
+    @{ Case = 'a line feed and ::set-output'; Value = "x`n::set-output name=file::/tmp/evil" }
+    @{ Case = 'CR LF and ::add-mask'; Value = "x`r`n::add-mask::y" }
+    @{ Case = 'a carriage return'; Value = "x`ry" }
+    @{ Case = 'NUL'; Value = "x$([char]0)y" }
+    @{ Case = 'a tab'; Value = "x`ty" }
+    @{ Case = 'NEL (U+0085)'; Value = "x$([char]0x85)y" }
+    @{ Case = 'U+2028'; Value = "x$([char]0x2028)y" }
+    @{ Case = 'U+2029'; Value = "x$([char]0x2029)y" }
+    @{ Case = 'a right-to-left override (U+202E)'; Value = "x$([char]0x202E)y" }
+  ) {
+    { Write-StoreStepOutput -Path $OutFile -Values ([ordered]@{ file_name = 'ok'; file = $Value }) } | Should -Throw -ExpectedMessage 'refused: step output file holds a line break or another control character; no output was written'
+    [IO.File]::ReadAllText($OutFile) | Should -BeExactly "before=1`n"
+  }
+  It 'refuses an output name with <Case> and writes no output at all' -ForEach @(
+    @{ Case = 'a line feed'; Name = "file`nsha256" }, @{ Case = '='; Name = 'a=b' }, @{ Case = 'a heredoc <<'; Name = 'file<<EOF' }
+    @{ Case = 'nothing'; Name = '' }, @{ Case = 'upper case'; Name = 'File' }
+  ) {
+    $v = [ordered]@{ ok = 'x' }; $v[$Name] = 'y'
+    { Write-StoreStepOutput -Path $OutFile -Values $v } | Should -Throw -ExpectedMessage 'refused: a step output name is not valid; no output was written'
+    [IO.File]::ReadAllText($OutFile) | Should -BeExactly "before=1`n"
+  }
+  It 'Test-StorePackageFileName accepts a plain name and refuses <Case>' -ForEach @(
+    @{ Case = '::'; Name = 'a::add-mask::b.msixupload' }, @{ Case = '##['; Name = '##[set-output name=x]b.msixupload' }
+    @{ Case = 'a line feed'; Name = "a`nb.msixupload" }, @{ Case = 'U+2028'; Name = "a$([char]0x2028)b.msixupload" }, @{ Case = 'nothing'; Name = '' }
+  ) {
+    Test-StorePackageFileName $File | Should -BeTrue
+    Test-StorePackageFileName $Name | Should -BeFalse
+  }
+}
+
 Describe 'Publish-StoreSubmission (fake Store)' {
   BeforeEach { $script:Pkg = New-TestPackage }
   AfterEach { Remove-Item -LiteralPath (Split-Path $Pkg) -Recurse -Force }
+
+  # What is uploaded is the read-only copy Get-StorePackage checked and hashed,
+  # not the file in the package folder.
+  It 'uploads the checked copy: a package replaced in the package folder after Get-StorePackage does not change what is sent' {
+    $dir = Join-Path ([IO.Path]::GetTempPath()) ('pkgdir-' + [guid]::NewGuid().ToString('N'))
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ('runner-temp-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory $tmp | Out-Null
+    $saved = $env:RUNNER_TEMP
+    try {
+      $env:RUNNER_TEMP = $tmp
+      $orig = & (Join-Path $PSScriptRoot 'New-TestMsixUpload.ps1') -Dir $dir -Version '0.4.1.0' -FileName $File
+      $p = Get-StorePackage -Dir $dir -ExpectedName 'Contoso.ExampleApp' -ExpectedPublisher 'CN=00000000-0000-0000-0000-000000000000' -ExpectedVersion '0.4.1.0' 6>$null
+      $p.Path | Should -Not -Be $orig
+      (Split-Path -Leaf $p.Path) | Should -BeExactly $File
+      # After the check: other bytes under the same name in the package folder.
+      [IO.File]::WriteAllBytes($orig, [byte[]](1..200))
+      $s = New-FakeStore; Use-FakeStore $s
+      $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $p.Path -ExpectedSha256 $p.Sha256 -ExpectedFileName $File -ExpectedVersion '0.4.1.0' -CommitReadBackAttempts 3 -CommitReadBackIntervalSeconds 0 }
+      $r.Err | Should -BeNullOrEmpty
+      $sent = @(Get-FakeUploadedZip $s)
+      $sent.Count | Should -Be 1
+      $sent[0].Name | Should -BeExactly $File
+      [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([byte[]]$sent[0].Bytes)).ToLowerInvariant() | Should -BeExactly $p.Sha256
+    } finally { $env:RUNNER_TEMP = $saved; Remove-Item -LiteralPath $dir, $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+  }
+  It 'sends nothing when the package changed after its SHA-256 was taken' {
+    $s = New-FakeStore; Use-FakeStore $s
+    $sha = Get-TestSha $Pkg
+    [IO.File]::WriteAllBytes($Pkg, [byte[]](1..255))
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedSha256 $sha -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
+    $r.Err | Should -BeExactly "not publishing: the package's SHA-256 is not the one checked before (the file changed since); nothing was sent"
+    @($s.Log).Count | Should -Be 0
+  }
+  It 'Send-StorePackage uploads nothing when the file it opened is not the one checked (<Case>)' -ForEach @(
+    @{ Case = 'another SHA-256'; Sha = ('0' * 64); Err = "package upload refused: the package's SHA-256 is not the one checked before (the file changed since); nothing was sent" }
+    @{ Case = 'not a SHA-256'; Sha = ('A' * 64); Err = 'package upload refused: the expected SHA-256 is not 64 lower-case hex digits; nothing was sent' }
+  ) {
+    $s = New-FakeStore; Use-FakeStore $s
+    $r = Invoke-Captured { Send-StorePackage -UploadUrl 'https://fakeupload.blob.core.windows.net/blob/upload.zip?sv=1&sig=FAKE%2BSAS' -PackagePath $Pkg -ExpectedSha256 $Sha }
+    $r.Err | Should -BeExactly $Err
+    @($s.Log).Count | Should -Be 0
+    @(Get-FakeUploadedZip $s).Count | Should -Be 0
+  }
+  It '<Fn> sends nothing for a package file name with <Case>' -ForEach @(
+    @{ Fn = 'Publish-StoreSubmission'; Case = '##['; Name = '##[set-output name=submission_id]ExampleApp-0.4.1.0-x64.msixupload' }
+    @{ Fn = 'Publish-StoreSubmission'; Case = 'a line feed and ::error'; Name = "ExampleApp-0.4.1.0-x64.msixupload`n::error::x" }
+    @{ Fn = 'Assert-SubmissionHasPackage'; Case = '##['; Name = '##[add-mask]ExampleApp-0.4.1.0-x64.msixupload' }
+    @{ Fn = 'Assert-SubmissionHasPackage'; Case = 'a line feed and ::error'; Name = "ExampleApp-0.4.1.0-x64.msixupload`n::error::x" }
+  ) {
+    $s = New-FakeStore; Use-FakeStore $s
+    $r = if ($Fn -ceq 'Publish-StoreSubmission') {
+      Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedSha256 (Get-TestSha $Pkg) -ExpectedFileName $Name -ExpectedVersion '0.4.1.0' }
+    } else {
+      Invoke-Captured { Assert-SubmissionHasPackage -ProductId $App -SubmissionId $NewId -ExpectedVersion '0.4.1.0' -ExpectedFileName $Name -TimeoutMinutes 0 -IntervalSeconds 0 }
+    }
+    $r.Err | Should -BeExactly "$(if ($Fn -ceq 'Publish-StoreSubmission') { 'not publishing' } else { 'not reading back' }): the package file name holds a line break, another control character or workflow command text; nothing was sent"
+    @($s.Log).Count | Should -Be 0
+  }
 
   It 'creates, updates, uploads, checks and commits by the id from the create response' {
     $s = New-FakeStore; Use-FakeStore $s
@@ -1092,14 +1200,14 @@ Describe 'Publish-StoreSubmission (fake Store)' {
 
   It 'prints one fixed line for a successful upload and nothing from the URL' {
     $s = New-FakeStore; Use-FakeStore $s
-    $r = Invoke-Captured { Send-StorePackage -UploadUrl "https://fakeupload.blob.core.windows.net/blob/upload.zip?sv=1&sig=FAKE+SAS%2FSIGNATURE-0123456789" -PackagePath $Pkg }
+    $r = Invoke-Captured { Send-StorePackage -UploadUrl "https://fakeupload.blob.core.windows.net/blob/upload.zip?sv=1&sig=FAKE+SAS%2FSIGNATURE-0123456789" -PackagePath $Pkg -ExpectedSha256 (Get-TestSha $Pkg) }
     $r.Err | Should -BeNullOrEmpty
     $r.Out | Should -Match "^package uploaded: $([regex]::Escape($File)) in Upload\.zip \(\d+ bytes\), HTTP 201$"
   }
 
   It 'refuses a plain-HTTP upload URL before zipping or sending anything' {
     Mock -ModuleName MsStoreRunner Invoke-StoreHttp { throw 'called' }
-    $r = Invoke-Captured { Send-StorePackage -UploadUrl "http://fakeupload.blob.core.windows.net/blob/upload.zip?sv=1&sig=FAKE+SAS%2FSIGNATURE-0123456789" -PackagePath $Pkg }
+    $r = Invoke-Captured { Send-StorePackage -UploadUrl "http://fakeupload.blob.core.windows.net/blob/upload.zip?sv=1&sig=FAKE+SAS%2FSIGNATURE-0123456789" -PackagePath $Pkg -ExpectedSha256 (Get-TestSha $Pkg) }
     $r.Err | Should -Match '^package upload refused'
     $r.All | Should -Not -Match $Leak
     Should -Invoke -ModuleName MsStoreRunner Invoke-StoreHttp -Times 0 -Exactly
@@ -1562,7 +1670,7 @@ Describe 'HTTP 202 and other 2xx: accepted, completion unconfirmed (fake Store)'
       $v | Should -BeNullOrEmpty
       & (Get-Module MsStoreRunner) { param($r) Get-StoreErrorStatus $r } $rec | Should -Be $Status
     }
-    $r = Invoke-Captured { Send-StorePackage -UploadUrl 'https://fakeupload.blob.core.windows.net/blob/upload.zip?sv=1&sig=FAKE%2BSAS' -PackagePath $Pkg }
+    $r = Invoke-Captured { Send-StorePackage -UploadUrl 'https://fakeupload.blob.core.windows.net/blob/upload.zip?sv=1&sig=FAKE%2BSAS' -PackagePath $Pkg -ExpectedSha256 (Get-TestSha $Pkg) }
     if ($Change -eq 'done') {
       $r.Err | Should -BeNullOrEmpty
       $r.Out | Should -Match "^package uploaded: .*, HTTP $Status$"
@@ -2227,7 +2335,7 @@ Describe 'Credentials planted at every spot of every API answer are never printe
     # What an end-to-end run does once signed in (S: its fake Store).
     $script:PlantPublish = {
       param($S)
-      Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedFileName $File -ExpectedVersion '0.4.1.0' -CommitReadBackAttempts 2 -CommitReadBackIntervalSeconds 0
+      Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedSha256 (Get-TestSha $Pkg) -ExpectedFileName $File -ExpectedVersion '0.4.1.0' -CommitReadBackAttempts 2 -CommitReadBackIntervalSeconds 0
     }
     $script:PlantVerify = {
       param($S)
@@ -2790,7 +2898,7 @@ Describe 'Time budget: the commit hand-off prints before the step can time out (
     # minutes) unless Set overrides it; a $null value leaves that parameter out.
     function script:Invoke-TimedPublish([string]$Package, [hashtable]$Set = @{}) {
       $global:FakeClock = $T0
-      $p = @{ ProductId = $App; PackagePath = $Package; ExpectedFileName = $File; ExpectedVersion = '0.4.1.0'; DeadlineUtc = $T0.AddMinutes(18) }
+      $p = @{ ProductId = $App; PackagePath = $Package; ExpectedSha256 = (Get-TestSha $Package); ExpectedFileName = $File; ExpectedVersion = '0.4.1.0'; DeadlineUtc = $T0.AddMinutes(18) }
       foreach ($k in $Set.Keys) { if ($null -eq $Set[$k]) { $p.Remove($k) } else { $p[$k] = $Set[$k] } }
       Invoke-Captured { Publish-StoreSubmission @p }
     }
@@ -3701,7 +3809,7 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
       $global:VerbosePreference = 'Continue'; $global:DebugPreference = 'Continue'
       $all = & {
         Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer -Verbose -Debug
-        $id = Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedFileName $File -ExpectedVersion '0.4.1.0'
+        $id = Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedSha256 (Get-TestSha $Pkg) -ExpectedFileName $File -ExpectedVersion '0.4.1.0'
         Assert-SubmissionHasPackage -ProductId $App -SubmissionId $id -ExpectedVersion '0.4.1.0' -TimeoutMinutes 0 -IntervalSeconds 0
       } *>&1
       foreach ($x in $all) { $records.Add($x) }
@@ -3899,7 +4007,7 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
     $out = Join-Path (Split-Path $Pkg) 'github-output.txt'
     New-Item -ItemType File $out | Out-Null
     $common = @{ STORE_PRODUCT_ID = $App; PC_TENANT_ID = 'tenant-1'; PC_CLIENT_ID = 'client-1'; PC_CLIENT_SECRET = $Secret; GITHUB_OUTPUT = $out
-      PKG_NAME = $File; EXPECTED_VERSION = '0.4.1.0' }
+      PKG_NAME = $File; EXPECTED_VERSION = '0.4.1.0'; EXPECTED_SHA256 = (Get-TestSha $Pkg) }
     $r = Invoke-ActionStep $SubmitStep ($common + @{ SUBMIT_MINUTES = '18'; PKG_FILE = $Pkg })
     $r.Err | Should -BeNullOrEmpty
     @(Get-Content -LiteralPath $out) | Should -Be @("submission_id=$NewId")
@@ -3918,7 +4026,7 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
     $out = Join-Path (Split-Path $Pkg) 'github-output.txt'
     New-Item -ItemType File $out | Out-Null
     $r = Invoke-ActionStep $SubmitStep @{ STORE_PRODUCT_ID = $App; PC_TENANT_ID = 'tenant-1'; PC_CLIENT_ID = 'client-1'; PC_CLIENT_SECRET = $Secret
-      GITHUB_OUTPUT = $out; PKG_NAME = $File; EXPECTED_VERSION = '0.4.1.0'; SUBMIT_MINUTES = '7'; PKG_FILE = $Pkg }
+      GITHUB_OUTPUT = $out; PKG_NAME = $File; EXPECTED_VERSION = '0.4.1.0'; EXPECTED_SHA256 = (Get-TestSha $Pkg); SUBMIT_MINUTES = '7'; PKG_FILE = $Pkg }
     $r.Err | Should -Match '^not publishing: the deadline .* leaves less than 60 s for the work before the commit \(360 s are kept for the commit and its read-backs\); nothing was sent$'
     @($Srv.Log) | Should -Be @('POST /tenant-1/oauth2/v2.0/token')
     (Get-Item -LiteralPath $out).Length | Should -Be 0
@@ -3948,7 +4056,7 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
   It 'commit that never answers: prints the hand-off first, gives up after its timeout, says "result unconfirmed", then reads back' -ForEach @(@{ Opt = @{ HangOn = 'Commit' } }) {
     Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedFileName $File -ExpectedVersion '0.4.1.0' -CommitTimeoutSeconds 2 -CommitReadBackAttempts 2 -CommitReadBackIntervalSeconds 1 -CommitReadBackTimeoutSeconds 5 -CommitReadBackBudgetSeconds 20 }
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedSha256 (Get-TestSha $Pkg) -ExpectedFileName $File -ExpectedVersion '0.4.1.0' -CommitTimeoutSeconds 2 -CommitReadBackAttempts 2 -CommitReadBackIntervalSeconds 1 -CommitReadBackTimeoutSeconds 5 -CommitReadBackBudgetSeconds 20 }
     $sw.Stop()
     $lines = @($r.Out -split "`n")
     $pre = Get-LineIndex $lines "^committing submission $NewId \(waiting up to 2 s for the answer\)\. If this step ends before a commit result is printed below, the result is unconfirmed"
@@ -3965,7 +4073,7 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
   It 'read-backs that never answer: each GET gives up after its timeout and they stop within the budget' -ForEach @(@{ Opt = @{ LoseResponse = 'Commit'; LoseWhen = 'Before'; LoseAsStatus = 504; HangOn = 'ReadBack' } }) {
     Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedFileName $File -ExpectedVersion '0.4.1.0' -CommitReadBackIntervalSeconds 1 -CommitReadBackTimeoutSeconds 1 -CommitReadBackBudgetSeconds 4 }
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedSha256 (Get-TestSha $Pkg) -ExpectedFileName $File -ExpectedVersion '0.4.1.0' -CommitReadBackIntervalSeconds 1 -CommitReadBackTimeoutSeconds 1 -CommitReadBackBudgetSeconds 4 }
     $sw.Stop()
     $log = @($Srv.Log)
     $reads = @($log | Select-Object -Skip ([array]::IndexOf($log, "POST $Base/submissions/$NewId/commit") + 1))
@@ -4075,7 +4183,7 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
   # token never goes to the blob host.
   It 'the package upload carries Content-Length (not chunked), the block-blob headers, a User-Agent and no Authorization header' {
     Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
-    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedSha256 (Get-TestSha $Pkg) -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
     $r.Err | Should -BeNullOrEmpty
     $Srv.Blob.Length | Should -BeGreaterThan 0
     $Srv.BlobHeaders['Content-Length'] | Should -BeExactly ([string]$Srv.Blob.Length)
@@ -4095,7 +4203,7 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
   # charset is read as UTF-8 (as Invoke-WebRequest read it), not lost.
   It 'create and commit POSTs carry no body and no Content-Type; every request asks for gzip, deflate, br' {
     Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
-    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedSha256 (Get-TestSha $Pkg) -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
     $r.Err | Should -BeNullOrEmpty
     $posts = @($Srv.Seen | Where-Object { $_.Line -cmatch '^POST .*/submissions(/\d+/commit)?$' })
     @($posts | ForEach-Object { $_.Line }) | Should -Be @("POST $Base/submissions", "POST $Base/submissions/$($Srv.NewId)/commit")
@@ -4105,6 +4213,18 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
     }
     @($Srv.Seen).Count | Should -BeGreaterThan 5
     foreach ($s in $Srv.Seen) { $s.Headers['Accept-Encoding'] | Should -BeExactly 'gzip, deflate, br' }
+  }
+  # .NET 11 (PowerShell 7.7) adds zstd to DecompressionMethods.All; the module
+  # names gzip, deflate and br itself, so the header is the same on every .NET.
+  It 'asks for gzip, deflate and br only, never zstd (.NET <Net>)' -ForEach @(@{ Net = [Environment]::Version.ToString() }) {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $r = Invoke-Captured { Assert-NoPendingSubmission -ProductId $App }
+    $r.Err | Should -BeNullOrEmpty
+    @($Srv.Seen).Count | Should -BeGreaterThan 1
+    foreach ($s in $Srv.Seen) {
+      $s.Headers['Accept-Encoding'] | Should -BeExactly 'gzip, deflate, br'
+      $s.Headers['Accept-Encoding'] | Should -Not -Match 'zstd'
+    }
   }
   It 'an answer with the charset <CharSet> is read (<Why>), its body not lost' -ForEach @(
     @{ CharSet = 'x-bogus-zz'; Why = 'unknown: as UTF-8, as Invoke-WebRequest read it'; Opt = @{ AnswerContentType = 'application/json; charset=x-bogus-zz' } }
@@ -4175,7 +4295,7 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
     Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
     Mock -ModuleName MsStoreRunner Get-CallTimeout { [Math]::Min($Requested, 2) }
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedSha256 (Get-TestSha $Pkg) -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
     $sw.Stop()
     $lost = if ($Opt.DripEnd -eq 'Break') { 'body not received (the connection broke or the body could not be read)' } else { 'body not received (time limit of 2 s for the whole request reached)' }
     $r.Out | Should -Match ('(?m)^' + [regex]::Escape("::warning title=Store create::Created, id unknown: the Store answered the create with HTTP 201, so it created a submission, but this run did not get its id (Store API POST $Base/submissions?isMinimalResponse=true failed: HTTP 201; $lost)."))
@@ -4197,7 +4317,7 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
     @{ Status = 200; Case = 'carried out'; Done = $true; Opt = @{ DripOn = 'Commit'; DripSeconds = 15 } }
   ) {
     Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
-    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedFileName $File -ExpectedVersion '0.4.1.0' -CommitTimeoutSeconds 2 -CommitReadBackAttempts 3 -CommitReadBackIntervalSeconds 0 }
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedSha256 (Get-TestSha $Pkg) -ExpectedFileName $File -ExpectedVersion '0.4.1.0' -CommitTimeoutSeconds 2 -CommitReadBackAttempts 3 -CommitReadBackIntervalSeconds 0 }
     $why = if ($Status -eq 200) { 'HTTP 200' } else { 'HTTP 503; hint: the service reported that it is unavailable' }
     $r.Out | Should -Match ([regex]::Escape("Store API POST $Base/submissions/$NewId/commit failed: $why; body not received (time limit of 2 s for the whole request reached)"))
     if ($Done) {
@@ -4309,7 +4429,7 @@ Describe 'HTTP 202 Accepted over real HTTP: accepted, completion unconfirmed (fa
     Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
     Mock -ModuleName MsStoreRunner Get-CallTimeout { [Math]::Min($Requested, 2) }
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedSha256 (Get-TestSha $Pkg) -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
     $sw.Stop()
     $lost = switch ($How) { 'read' { '' } 'cut off' { "; $Broken" } default { "; $Limit2" } }
     $answer = "Store API POST $Base/submissions?isMinimalResponse=true answered HTTP 202: accepted, completion unconfirmed$lost"
@@ -4343,7 +4463,7 @@ Describe 'HTTP 202 Accepted over real HTTP: accepted, completion unconfirmed (fa
   ) {
     Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
     Mock -ModuleName MsStoreRunner Get-CallTimeout { [Math]::Min($Requested, 2) }
-    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedSha256 (Get-TestSha $Pkg) -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
     $r.Err | Should -Match ('^' + [regex]::Escape("Store API PUT $Base/submissions/$NewId answered HTTP 202: accepted, completion unconfirmed; $Limit2. Accepted, completion unconfirmed: the Store accepted the update of submission $NewId but has not confirmed it is done. Not committed: this run stops, draft $NewId stays uncommitted and nothing more is sent to it. Read-back of submission $NewId by id (one GET; nothing changed): status PendingCommit; packages: "))
     @($Srv.Log)[-2..-1] | Should -Be @("PUT $Base/submissions/$NewId", "GET $Base/submissions/$NewId")
     $r.All | Should -Not -Match "updated: old packages|$DeleteAdvice|$RetryAdvice|$Leak|$([regex]::Escape($Url))"
@@ -4353,7 +4473,7 @@ Describe 'HTTP 202 Accepted over real HTTP: accepted, completion unconfirmed (fa
     @{ Opt = @{ AcceptOn = 'Upload'; AcceptNotDone = $true; UploadBody = '<x/>' } }
   ) {
     Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
-    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedSha256 (Get-TestSha $Pkg) -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
     $r.Err | Should -Match ('^' + [regex]::Escape("package upload answered HTTP 202: accepted, completion unconfirmed (not confirmed stored). Accepted, completion unconfirmed: the Store accepted the package upload of submission $NewId but has not confirmed it is done. Not committed: this run stops"))
     @($Srv.Log)[-2..-1] | Should -Be @('PUT /blob/upload.zip', "GET $Base/submissions/$NewId")
     $r.All | Should -Not -Match "package uploaded|draft verified|$DeleteAdvice|$RetryAdvice|$Leak|$([regex]::Escape($Url))"
@@ -4364,7 +4484,7 @@ Describe 'HTTP 202 Accepted over real HTTP: accepted, completion unconfirmed (fa
     @{ How = 'read'; Case = 'not carried out'; Done = $false; Opt = @{ AcceptOn = 'Commit'; AcceptNotDone = $true } }
   ) {
     Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
-    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedFileName $File -ExpectedVersion '0.4.1.0' -CommitTimeoutSeconds 2 -CommitReadBackAttempts 3 -CommitReadBackIntervalSeconds 0 }
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedSha256 (Get-TestSha $Pkg) -ExpectedFileName $File -ExpectedVersion '0.4.1.0' -CommitTimeoutSeconds 2 -CommitReadBackAttempts 3 -CommitReadBackIntervalSeconds 0 }
     $lost = if ($How -eq 'cut off') { "; $Broken" } else { '' }
     $failure = "Store API POST $Base/submissions/$NewId/commit answered HTTP 202: accepted, completion unconfirmed$lost"
     $got = 'was accepted (HTTP 202) but the Store has not confirmed it is done'
@@ -4402,7 +4522,7 @@ Describe 'HTTP 202 Accepted over real HTTP: accepted, completion unconfirmed (fa
   }
   It 'the pending check answered HTTP 202 over HTTP: a failed read, not publishing, nothing created' -ForEach @(@{ Opt = @{ AcceptOn = 'AppRead' } }) {
     Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
-    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedSha256 (Get-TestSha $Pkg) -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
     $r.Err | Should -BeExactly "Store API GET $Base failed: HTTP 202 (a read is used only when answered HTTP 200); cannot check for a pending submission; not publishing"
     @($Srv.Log) | Should -Be @($Token1, "GET $Base")
   }
@@ -4519,7 +4639,7 @@ Describe 'Every known credential is masked in every line printed and every error
         'Get-SubmissionUploadUrl' { [void](Get-SubmissionUploadUrl $Json) }
         'Read-SubmissionSafe' { [void](Read-SubmissionSafe -SubmissionJson $Json) }
         # No such file: it throws before zipping or sending anything.
-        'Send-StorePackage' { try { Send-StorePackage -UploadUrl $U -PackagePath (Join-Path ([IO.Path]::GetTempPath()) 'none-dir/none.msix') } catch { } }
+        'Send-StorePackage' { try { Send-StorePackage -UploadUrl $U -PackagePath (Join-Path ([IO.Path]::GetTempPath()) 'none-dir/none.msix') -ExpectedSha256 ('0' * 64) } catch { } }
       }
     } $Fn $json $u
     & $Mod { param($s) Hide-StoreSecret "a $s b" } $sig | Should -BeExactly 'a [redacted] b'

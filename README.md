@@ -33,6 +33,19 @@ every call after the create names this run's submission id.
 | `diagnose` | yes | GET calls only. Prints which fields differ between a given submission and the last published one, as field paths, never values. |
 | `delete-draft` | yes | Deletes one given submission by id, only while it is the app's pending, uncommitted `PendingCommit` draft. |
 
+### The package
+
+The package step reads the `.msixupload` from `package-dir` once: it copies
+it into a new read-only folder under the runner's temp folder, and the
+manifest check, the SHA-256 and the upload all use that copy. The upload
+checks the SHA-256 again on the same open file it zips from, so a file
+replaced in `package-dir` after the check is never what gets uploaded.
+
+A file name or manifest identity field with a line break or another control
+character stops the run before any output is written, and so does a file name
+with workflow command text (`::` or `##[`). Package text the action prints
+has workflow command syntax made inert.
+
 ### The publish flow
 
 Each step works on this run's submission id:
@@ -265,8 +278,10 @@ Pester 5.7.1. The suite covers the submission JSON checks, the full publish,
 diagnose and delete-draft flows against the in-memory fake Store, the real
 HTTP path against the fake Store served on 127.0.0.1 (including the
 `action.yml` step scripts run as written), and static checks on `action.yml`.
-`.github/workflows/ci.yml` runs it on Windows and Linux, and runs the action
-itself in `inspect` mode on a generated package.
+`.github/workflows/ci.yml` runs it on Windows and Linux with the runner's
+PowerShell, and on Linux with PowerShell 7.7.0 (.NET 11, checked against its
+release SHA-256), and runs the action itself in `inspect` mode on a
+generated package.
 
 ## License
 

@@ -113,8 +113,23 @@ $script:ReadOnlyCalls = $false
 $script:DeleteOnlyPath = ''
 $script:DeleteOnlySent = $false
 
-# Finds the one Store package in $Dir and checks its identity and version.
-# Returns Path (the full path of the .msixupload that is uploaded), FileName, Version (the manifest Identity Version) and Sha256.
+# Finds the one Store package in $Dir, copies it and checks its identity and
+# version. Returns Path (the copy, which is what gets uploaded), FileName,
+# Version (the manifest Identity Version) and Sha256 (of the copy).
+#
+# The copy: the package is read from $Dir once, into a new folder under the
+# runner's temp folder (RUNNER_TEMP, else the system temp folder), and made
+# read-only. The manifest check and the SHA-256 read that copy, and the
+# publish step uploads it (Send-StorePackage checks the SHA-256 again on the
+# handle it zips from), so a file replaced in $Dir after the check is never
+# what gets uploaded.
+#
+# Package text (the folder, file names, manifest fields) can hold anything.
+# A manifest field with a line break or another control character stops the
+# run (Test-StorePlainText), and so does a file name with one or with workflow
+# command text (Test-StorePackageFileName); package text is printed and
+# thrown only through Protect-WorkflowCommand, so it cannot run a workflow
+# command.
 function Get-StorePackage {
   param(
     [Parameter(Mandatory)][string]$Dir,
@@ -123,36 +138,89 @@ function Get-StorePackage {
     [string]$ExpectedVersion = ''
   )
   $all = @(Get-ChildItem -LiteralPath $Dir -File | Where-Object { $_.Name -like '*.msixupload' })
-  if ($all.Count -ne 1) { throw (Hide-StoreSecret "expected exactly one .msixupload in $Dir, found $($all.Count)") }
+  if ($all.Count -ne 1) { throw (Hide-StoreSecret (Protect-WorkflowCommand "expected exactly one .msixupload in $Dir, found $($all.Count)")) }
   $upload = $all[0]
+  # The file name goes on to the step outputs, the later steps' logs and the
+  # Store, so it is refused rather than changed.
+  if (-not (Test-StorePackageFileName $upload.Name)) { throw (Hide-StoreSecret "the .msixupload file name holds a line break, another control character or workflow command text") }
   # Only the exact lower-case extension is accepted, as the Store CLI did.
-  if ($upload.Extension -cne '.msixupload') { throw (Hide-StoreSecret "extension '$($upload.Extension)' is not exactly .msixupload") }
-  if ($upload.Length -le 0) { throw (Hide-StoreSecret "$($upload.Name) is empty") }
+  if ($upload.Extension -cne '.msixupload') { throw (Hide-StoreSecret (Protect-WorkflowCommand "extension '$($upload.Extension)' is not exactly .msixupload")) }
+  if ($upload.Length -le 0) { throw (Hide-StoreSecret (Protect-WorkflowCommand "$($upload.Name) is empty")) }
 
+  $root = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
+  $keep = Join-Path $root ("msstore-package-" + [guid]::NewGuid().ToString('N'))
+  $copy = Join-Path $keep $upload.Name
   $work = Join-Path ([IO.Path]::GetTempPath()) ("msix-inspect-" + [guid]::NewGuid().ToString('N'))
-  New-Item -ItemType Directory $work | Out-Null
+  $kept = $false
+  New-Item -ItemType Directory $keep | Out-Null
   try {
-    Copy-Item -LiteralPath $upload.FullName (Join-Path $work 'upload.zip')
+    New-Item -ItemType Directory $work | Out-Null
+    Copy-Item -LiteralPath $upload.FullName $copy
+    (Get-Item -LiteralPath $copy).IsReadOnly = $true
+    $sha = Get-StoreFileSha256 $copy
+    # Expand-Archive wants a .zip name; the bytes it reads are checked to be
+    # the copy's.
+    Copy-Item -LiteralPath $copy (Join-Path $work 'upload.zip')
+    if ((Get-StoreFileSha256 (Join-Path $work 'upload.zip')) -cne $sha) { throw (Hide-StoreSecret "the package copy changed while it was read") }
     Expand-Archive (Join-Path $work 'upload.zip') (Join-Path $work 'upload')
     $msix = @(Get-ChildItem (Join-Path $work 'upload') -Filter *.msix)
     if ($msix.Count -ne 1) { throw (Hide-StoreSecret "expected one .msix inside the .msixupload, found $($msix.Count)") }
-    Write-StoreHost "Package: $($upload.FullName) contains $($msix[0].Name) ($($msix[0].Length) bytes)"
+    Write-StoreHost (Protect-WorkflowCommand "Package: $($upload.FullName) contains $($msix[0].Name) ($($msix[0].Length) bytes)")
     Copy-Item -LiteralPath $msix[0].FullName (Join-Path $work 'pkg.zip')
     Expand-Archive (Join-Path $work 'pkg.zip') (Join-Path $work 'pkg')
     [xml]$m = Get-Content -LiteralPath (Join-Path $work 'pkg' 'AppxManifest.xml')
     $id = $m.Package.Identity
-    Write-StoreHost "Identity Name=$($id.Name) Publisher=$($id.Publisher) Version=$($id.Version)"
-    $version = [string]$id.Version
-    if ($id.Name -ne $ExpectedName) { throw (Hide-StoreSecret "unexpected Identity Name") }
-    if ($id.Publisher -ne $ExpectedPublisher) { throw (Hide-StoreSecret "unexpected Identity Publisher") }
-    if ($id.Version -notmatch '^\d+\.\d+\.\d+\.0$') { throw (Hide-StoreSecret "Store versions must end in .0") }
-    if ($ExpectedVersion -and $id.Version -ne $ExpectedVersion) { throw (Hide-StoreSecret "package version $($id.Version) does not match the expected version ($ExpectedVersion)") }
+    $name = [string]$id.Name; $publisher = [string]$id.Publisher; $version = [string]$id.Version
+    foreach ($f in @(@('Name', $name), @('Publisher', $publisher), @('Version', $version))) {
+      if (-not (Test-StorePlainText $f[1])) { throw (Hide-StoreSecret "the manifest Identity $($f[0]) holds a line break or another control character") }
+    }
+    Write-StoreHost (Protect-WorkflowCommand "Identity Name=$name Publisher=$publisher Version=$version")
+    if ($name -ne $ExpectedName) { throw (Hide-StoreSecret "unexpected Identity Name") }
+    if ($publisher -ne $ExpectedPublisher) { throw (Hide-StoreSecret "unexpected Identity Publisher") }
+    if ($version -cnotmatch '\A[0-9]+\.[0-9]+\.[0-9]+\.0\z') { throw (Hide-StoreSecret "Store versions must end in .0") }
+    if ($ExpectedVersion -and $version -cne $ExpectedVersion) { throw (Hide-StoreSecret (Protect-WorkflowCommand "package version $version does not match the expected version ($ExpectedVersion)")) }
+    $kept = $true
   } finally {
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    if (-not $kept) { Remove-Item -LiteralPath $keep -Recurse -Force -ErrorAction SilentlyContinue }
   }
-  $sha = (Get-FileHash -LiteralPath $upload.FullName -Algorithm SHA256).Hash.ToLower()
-  Write-StoreHost "$sha  $($upload.Name)"
-  [pscustomobject]@{ Path = $upload.FullName; FileName = $upload.Name; Version = $version; Sha256 = $sha }
+  Write-StoreHost (Protect-WorkflowCommand "$sha  $($upload.Name)")
+  [pscustomobject]@{ Path = $copy; FileName = $upload.Name; Version = $version; Sha256 = $sha }
+}
+
+# SHA-256 of a file, lower-case hex.
+function Get-StoreFileSha256([Parameter(Mandatory)][string]$Path) {
+  (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+# True when Text holds no control or format character and no line or
+# paragraph separator (CR, LF, NUL, tab, NEL, U+2028, zero-width and bidi
+# marks, ...). Only such text goes into a step output file, where a line
+# break would start a line of its own and set another output.
+function Test-StorePlainText([AllowNull()][AllowEmptyString()][string]$Text) {
+  [bool]($Text -cnotmatch '[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]')
+}
+
+# True when a package file name can be printed and sent as it is: plain text
+# (Test-StorePlainText) with no workflow command text, "::" or "##[". The name
+# is compared with the Store's, so it is refused, never changed, when not.
+function Test-StorePackageFileName([AllowNull()][AllowEmptyString()][string]$Name) {
+  [bool]($Name -and (Test-StorePlainText $Name) -and $Name -cnotmatch '::|##\[')
+}
+
+# Appends name=value lines to a step output file ($env:GITHUB_OUTPUT).
+# Every name and value is checked first (names: a-z, 0-9 and _; values:
+# Test-StorePlainText), and nothing is written unless all of them pass.
+function Write-StoreStepOutput {
+  param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][System.Collections.Specialized.OrderedDictionary]$Values)
+  if ($Values.Count -lt 1) { throw (Hide-StoreSecret "refused: no step output given; no output was written") }
+  $lines = @(foreach ($k in $Values.Keys) {
+    $n = [string]$k; $v = [string]$Values[$k]
+    if ($n -cnotmatch '^[a-z0-9_]{1,64}\z') { throw (Hide-StoreSecret "refused: a step output name is not valid; no output was written") }
+    if (-not (Test-StorePlainText $v)) { throw (Hide-StoreSecret "refused: step output $n holds a line break or another control character; no output was written") }
+    "$n=$v"
+  })
+  [IO.File]::AppendAllText($Path, (($lines -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
 }
 
 # Every credential this session has seen: the client
@@ -646,7 +714,9 @@ function Invoke-StoreHttp {
   $handler.AllowAutoRedirect = $false
   $handler.UseCookies = $false
   # As Invoke-WebRequest did: ask for gzip, deflate or br and decompress.
-  $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::All
+  # Named one by one, not DecompressionMethods.All: on .NET 11 (PowerShell
+  # 7.7) All adds zstd too, which changes the Accept-Encoding header.
+  $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate -bor [System.Net.DecompressionMethods]::Brotli
   $client = [System.Net.Http.HttpClient]::new($handler, $true)
   # The limit is enforced below; HttpClient's own 100 s default must not cut
   # a long upload short.
@@ -1809,19 +1879,34 @@ function Get-SubmissionUploadUrl([string]$SubmissionJson) {
 # Zips the package (at the zip root, as the CLI does) and PUTs the zip to the
 # submission's SAS upload URL as a block blob. Refuses an upload URL that is
 # not https to a blob storage account (Test-StoreUri Upload) before zipping.
+# The package is opened once: its SHA-256 is taken from that handle and must
+# be ExpectedSha256 (what Get-StorePackage checked), and the zip entry is
+# copied from the same handle, so the bytes sent are the bytes checked.
 # Prints one fixed line on success; on failure throws fixed text only.
 function Send-StorePackage {
-  param([Parameter(Mandatory)][string]$UploadUrl, [Parameter(Mandatory)][string]$PackagePath)
+  param([Parameter(Mandatory)][string]$UploadUrl, [Parameter(Mandatory)][string]$PackagePath, [Parameter(Mandatory)][string]$ExpectedSha256)
   Register-StoreUploadUrl $UploadUrl
+  if ($ExpectedSha256 -cnotmatch '^[0-9a-f]{64}\z') { throw (Hide-StoreSecret "package upload refused: the expected SHA-256 is not 64 lower-case hex digits; nothing was sent") }
   if (-not (Test-Path -LiteralPath $PackagePath -PathType Leaf)) { throw (Hide-StoreSecret "package file missing") }
   if (-not (Test-StoreUri -Uri $UploadUrl -Kind Upload)) { throw (Hide-StoreSecret "package upload refused: the upload URL is not $($script:UriRule.Upload); nothing was sent") }
   $name = Split-Path -Leaf $PackagePath
+  if (-not (Test-StorePackageFileName $name)) { throw (Hide-StoreSecret "package upload refused: the package file name holds a line break, another control character or workflow command text; nothing was sent") }
   $work = Join-Path ([IO.Path]::GetTempPath()) ("store-upload-" + [guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory $work | Out-Null
   try {
     $zip = Join-Path $work 'Upload.zip'
-    $z = [IO.Compression.ZipFile]::Open($zip, [IO.Compression.ZipArchiveMode]::Create)
-    try { [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($z, $PackagePath, $name) | Out-Null } finally { $z.Dispose() }
+    $src = [IO.File]::Open($PackagePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+      $sha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($src)).ToLowerInvariant()
+      if ($sha -cne $ExpectedSha256) { throw (Hide-StoreSecret "package upload refused: the package's SHA-256 is not the one checked before (the file changed since); nothing was sent") }
+      $src.Position = 0
+      $z = [IO.Compression.ZipFile]::Open($zip, [IO.Compression.ZipArchiveMode]::Create)
+      try {
+        $entry = $z.CreateEntry($name)
+        $to = $entry.Open()
+        try { $src.CopyTo($to) } finally { $to.Dispose() }
+      } finally { $z.Dispose() }
+    } finally { $src.Dispose() }
     $len = (Get-Item -LiteralPath $zip).Length
     # The CLI escapes '+' in the SAS URL the same way before uploading.
     try {
@@ -2193,6 +2278,7 @@ function Publish-StoreSubmission {
     [Parameter(Mandatory)][string]$PackagePath,
     [Parameter(Mandatory)][string]$ExpectedFileName,
     [Parameter(Mandatory)][string]$ExpectedVersion,
+    [Parameter(Mandatory)][string]$ExpectedSha256,
     [ValidateRange(1, 100)][int]$CommitReadBackAttempts = 10,
     [ValidateRange(0, 600)][int]$CommitReadBackIntervalSeconds = 30,
     [ValidateRange(1, 600)][int]$CommitTimeoutSeconds = 60,
@@ -2201,8 +2287,13 @@ function Publish-StoreSubmission {
     [datetime]$DeadlineUtc = (Get-StoreUtcNow).AddMinutes(18)
   )
   Assert-ProductId $ProductId
+  if (-not (Test-StorePackageFileName $ExpectedFileName)) { throw (Hide-StoreSecret "not publishing: the package file name holds a line break, another control character or workflow command text; nothing was sent") }
   if ((Split-Path -Leaf $PackagePath) -cne $ExpectedFileName) { throw (Hide-StoreSecret "package file is not $ExpectedFileName") }
   if (-not (Test-Path -LiteralPath $PackagePath -PathType Leaf)) { throw (Hide-StoreSecret "package file missing") }
+  # The package must still be the one Get-StorePackage checked; Send-StorePackage
+  # checks it again on the handle it uploads from.
+  if ($ExpectedSha256 -cnotmatch '^[0-9a-f]{64}\z') { throw (Hide-StoreSecret "not publishing: the expected SHA-256 is not 64 lower-case hex digits; nothing was sent") }
+  if ((Get-StoreFileSha256 $PackagePath) -cne $ExpectedSha256) { throw (Hide-StoreSecret "not publishing: the package's SHA-256 is not the one checked before (the file changed since); nothing was sent") }
   $DeadlineUtc = $DeadlineUtc.ToUniversalTime()
   $reserve = $CommitTimeoutSeconds + $CommitReadBackBudgetSeconds
   $commitBy = $DeadlineUtc.AddSeconds(-$reserve)
@@ -2270,7 +2361,7 @@ function Publish-StoreSubmission {
     catch { $stop = Get-UnverifiedDraftText $ProductId $id "$_" $read; throw (Hide-StoreSecret $stop) }
     $updated = $null
     Write-StoreHost "submission $id updated: old packages PendingDelete, $ExpectedFileName PendingUpload"
-    try { Send-StorePackage -UploadUrl $url -PackagePath $PackagePath }
+    try { Send-StorePackage -UploadUrl $url -PackagePath $PackagePath -ExpectedSha256 $ExpectedSha256 }
     catch {
       if (Test-StoreAccepted (Get-StoreErrorStatus $_)) { $stop = Resolve-AcceptedChange $ProductId $id "$_" 'package upload' 30 $ExpectedFileName; throw (Hide-StoreSecret $stop) }
       throw
@@ -2351,6 +2442,7 @@ function Assert-SubmissionHasPackage {
     [string]$ExpectedFileName = ''
   )
   Assert-SubmissionId $SubmissionId
+  if ($ExpectedFileName -and -not (Test-StorePackageFileName $ExpectedFileName)) { throw (Hide-StoreSecret "not reading back: the package file name holds a line break, another control character or workflow command text; nothing was sent") }
   Write-StoreHost "checking submission id=$SubmissionId (created and committed by this run)"
   $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
   $warned = $false
@@ -2545,4 +2637,4 @@ function Remove-StorePendingDraft {
   finally { $script:DeleteOnlyPath = $saved[0]; $script:DeleteOnlySent = $saved[1]; $script:CallDeadline = $saved[2] }
 }
 
-Export-ModuleMember -Function Get-StorePackage, Protect-StoreText, Test-StoreUri, Invoke-StoreHttp, Protect-WorkflowCommand, Get-ListedTarget, Get-StoreErrorText, Connect-StoreApi, Test-NoPendingSubmission, Read-AppPendingSubmissionId, Assert-NoPendingSubmission, New-StoreSubmission, Test-SubmissionPricing, Set-SubmissionPackage, Get-SubmissionComparedFields, Compare-SubmissionFields, Send-StorePackage, Test-DraftReadyToCommit, Invoke-SubmissionCommit, Remove-StoreDraftSubmission, Publish-StoreSubmission, Test-SubmissionHasPackage, Assert-SubmissionHasPackage, Read-AppLastPublishedSubmissionId, Get-SubmissionDiagnosis, Show-StoreSubmissionDiagnosis, Remove-StorePendingDraft
+Export-ModuleMember -Function Get-StorePackage, Test-StorePlainText, Test-StorePackageFileName, Write-StoreStepOutput, Protect-StoreText, Test-StoreUri, Invoke-StoreHttp, Protect-WorkflowCommand, Get-ListedTarget, Get-StoreErrorText, Connect-StoreApi, Test-NoPendingSubmission, Read-AppPendingSubmissionId, Assert-NoPendingSubmission, New-StoreSubmission, Test-SubmissionPricing, Set-SubmissionPackage, Get-SubmissionComparedFields, Compare-SubmissionFields, Send-StorePackage, Test-DraftReadyToCommit, Invoke-SubmissionCommit, Remove-StoreDraftSubmission, Publish-StoreSubmission, Test-SubmissionHasPackage, Assert-SubmissionHasPackage, Read-AppLastPublishedSubmissionId, Get-SubmissionDiagnosis, Show-StoreSubmissionDiagnosis, Remove-StorePendingDraft
