@@ -25,10 +25,10 @@ with a Pester test suite and a fake Store API that runs on 127.0.0.1.
 
 - [`microsoft/microsoft-store-apppublisher`](https://github.com/microsoft/microsoft-store-apppublisher)
   sets up the `msstore` CLI, and your workflow writes the publish steps with
-  it; `msstore publish --noCommit` leaves the submission it made as an
+  it; `msstore publish --noCommit` skips the commit, so the submission stays an
   uncommitted draft. This action's `publish` mode goes from create to commit,
   then reads the submission back (see [Why not the Store CLI](#why-not-the-store-cli)).
-- A `publish` run works only on the submission id it created. If the app
+- A `publish` run only updates and commits the submission it creates. If the app
   already has a pending submission, it stops and leaves that one alone.
 - Before the commit it compares the submission's fields. `inspect` shows the
   package's SHA-256 for the reviewer to check before approving `publish`, and
