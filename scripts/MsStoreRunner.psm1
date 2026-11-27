@@ -113,20 +113,28 @@ $script:ReadOnlyCalls = $false
 $script:DeleteOnlyPath = ''
 $script:DeleteOnlySent = $false
 
-# The most bytes Get-StorePackage and Send-StorePackage read: each holds the
-# package (and Send-StorePackage its zip) in memory, and a .NET array or
-# memory stream holds less than 2 GiB.
+# The most package bytes held in memory at once (a .NET array holds less than
+# 2 GiB). Get-StorePackage holds the .msixupload and the .msix unpacked from
+# it, together at most this many bytes; Send-StorePackage reads a package of
+# at most this many bytes and holds the zip it sends, in a buffer of a size
+# set before it is built (Send-StorePackage). Every read is counted as it goes
+# (Copy-StoreBounded) and stops one byte past what it may read.
 $script:MaxPackageBytes = 2000000000
+# The most bytes of AppxManifest.xml read, and the most characters its parser
+# reads (with no DTD there are no more characters than bytes).
+$script:MaxManifestBytes = 1048576
 
 # Finds the one Store package in $Dir, copies it and checks its identity and
 # version. Returns Path (the copy, which is what gets uploaded), FileName,
 # Version (the manifest Identity Version) and Sha256 (of the copy).
 #
-# The package is read from $Dir once, into memory (Open-StorePackageRead), at
-# most MaxPackageBytes. The SHA-256, the copy and the manifest check all use
-# those bytes; no file is read a second time. The copy is written to a new
-# folder under the runner's temp folder (RUNNER_TEMP, else the system temp
-# folder) and made read-only, and the publish step uploads it
+# The package is read from $Dir once, into memory (Open-StorePackageRead): as
+# many bytes as the file had when it was opened, at most MaxPackageBytes, and
+# one byte more refuses it with nothing more read. The SHA-256, the copy and
+# the manifest check all use those bytes; no file is read a second time. The
+# copy is written to a new folder under the runner's temp folder
+# (RUNNER_TEMP, else the system temp folder) and made read-only, and the
+# publish step uploads it
 # (Send-StorePackage hashes the bytes it zips in the same pass and sends
 # nothing unless they are these), so a file replaced in $Dir after the check
 # is never what gets uploaded.
@@ -163,11 +171,17 @@ function Get-StorePackage {
   $kept = $false
   New-Item -ItemType Directory $keep | Out-Null
   try {
-    # The one read of the package.
-    $bytes = [IO.MemoryStream]::new()
+    # The one read of the package, into a buffer of the size the file has
+    # once open: counted as it goes, it stops one byte past that size.
     $src = Open-StorePackageRead $upload.FullName
-    try { $src.CopyTo($bytes) } finally { $src.Dispose() }
-    if ($bytes.Length -le 0 -or $bytes.Length -gt $script:MaxPackageBytes) { throw (Hide-StoreSecret "the .msixupload changed size while it was read") }
+    try {
+      $len = $src.Length
+      if ($len -gt $script:MaxPackageBytes) { throw (Hide-StoreSecret "the .msixupload is larger than $($script:MaxPackageBytes) bytes, the most this action reads") }
+      if ($len -le 0) { throw (Hide-StoreSecret "the .msixupload changed size while it was read") }
+      $bytes = [IO.MemoryStream]::new([int]$len)
+      $got = Copy-StoreBounded $src $bytes $len
+    } finally { $src.Dispose() }
+    if ($got -ne $len) { throw (Hide-StoreSecret "the .msixupload changed size while it was read") }
     $bytes.Position = 0
     $sha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
     $out = [IO.File]::Open($copy, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
@@ -202,6 +216,22 @@ function Open-StorePackageRead([Parameter(Mandatory)][string]$Path) {
   [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
 }
 
+# Copies From to To, counting the bytes as they are read, and returns the
+# count: at most Limit, or Limit + 1 when From holds more. No read asks for
+# more than one byte past Limit, so no more is ever read, and To never gets a
+# byte past Limit. A count over Limit is the caller's to refuse.
+function Copy-StoreBounded([IO.Stream]$From, [IO.Stream]$To, [long]$Limit) {
+  $buf = [byte[]]::new(81920)
+  [long]$total = 0
+  while ($true) {
+    $n = $From.Read($buf, 0, [int][Math]::Min([long]$buf.Length, $Limit - $total + 1))
+    if ($n -le 0) { return $total }
+    $total += $n
+    if ($total -gt $Limit) { return $total }
+    $To.Write($buf, 0, $n)
+  }
+}
+
 # Reads the manifest of a .msixupload held in memory (Package, as
 # Get-StorePackage read it): the one .msix at the zip root, then the
 # AppxManifest.xml at its root, parsed with no DTD and no external resource.
@@ -209,6 +239,13 @@ function Open-StorePackageRead([Parameter(Mandatory)][string]$Path) {
 # XmlDocument). A zip or .msix that cannot be unpacked, or a manifest that is
 # not XML, is thrown as fixed text: the reader's and the parser's messages can
 # quote the package (an XML error quotes the manifest text it stopped at).
+#
+# The .msix is unpacked into memory next to Package, the two together at most
+# MaxPackageBytes, and the manifest is read into memory, at most
+# MaxManifestBytes. Each is checked against the size its zip entry gives
+# before it is unpacked and read to that size, never past it: .NET stops a
+# deflated entry at that size but reads a stored one to its stored length, so
+# an entry holding more than its zip entry gives is refused one byte past it.
 function Read-StorePackageManifest([Parameter(Mandatory)][IO.MemoryStream]$Package) {
   $outer = $null; $inner = $null; $msixBytes = $null
   try {
@@ -218,27 +255,38 @@ function Read-StorePackageManifest([Parameter(Mandatory)][IO.MemoryStream]$Packa
       $msix = @($outer.Entries | Where-Object { $_.FullName -cnotmatch '[/\\]' -and $_.FullName -like '*.msix' })
     } catch { throw (Hide-StoreSecret "the .msixupload is not a zip archive that can be read (the reader's message is not printed)") }
     if ($msix.Count -ne 1) { throw (Hide-StoreSecret "expected one .msix inside the .msixupload, found $($msix.Count)") }
-    if ($msix[0].Length -gt $script:MaxPackageBytes) { throw (Hide-StoreSecret "the .msix inside the .msixupload is larger than $($script:MaxPackageBytes) bytes, the most this action reads") }
+    $size = $msix[0].Length
+    if ($size -gt $script:MaxPackageBytes - $Package.Length) { throw (Hide-StoreSecret "the .msixupload and the .msix inside it come to more than $($script:MaxPackageBytes) bytes, the most this action holds in memory") }
     try {
-      $msixBytes = [IO.MemoryStream]::new()
+      $msixBytes = [IO.MemoryStream]::new([int]$size)
       $s = $msix[0].Open()
-      try { $s.CopyTo($msixBytes) } finally { $s.Dispose() }
+      try { $got = Copy-StoreBounded $s $msixBytes $size } finally { $s.Dispose() }
+    } catch { throw (Hide-StoreSecret "the .msix inside the .msixupload is not a zip archive that can be read (the reader's message is not printed)") }
+    if ($got -ne $size) { throw (Hide-StoreSecret "the .msix inside the .msixupload does not have the size its zip entry gives (reading stops at that size)") }
+    try {
       $msixBytes.Position = 0
       $inner = [IO.Compression.ZipArchive]::new($msixBytes, [IO.Compression.ZipArchiveMode]::Read, $true)
       $man = @($inner.Entries | Where-Object { $_.FullName -ceq 'AppxManifest.xml' })
     } catch { throw (Hide-StoreSecret "the .msix inside the .msixupload is not a zip archive that can be read (the reader's message is not printed)") }
     if ($man.Count -ne 1) { throw (Hide-StoreSecret "expected one AppxManifest.xml at the root of the .msix, found $($man.Count)") }
+    $size = $man[0].Length
+    if ($size -gt $script:MaxManifestBytes) { throw (Hide-StoreSecret "the AppxManifest.xml in the .msix is larger than $($script:MaxManifestBytes) bytes, the most this action reads") }
+    try {
+      $manBytes = [IO.MemoryStream]::new([int]$size)
+      $s = $man[0].Open()
+      try { $got = Copy-StoreBounded $s $manBytes $size } finally { $s.Dispose() }
+    } catch { throw (Hide-StoreSecret "the .msix inside the .msixupload is not a zip archive that can be read (the reader's message is not printed)") }
+    if ($got -ne $size) { throw (Hide-StoreSecret "the AppxManifest.xml in the .msix does not have the size its zip entry gives (reading stops at that size)") }
     try {
       $set = [Xml.XmlReaderSettings]::new()
       $set.DtdProcessing = [Xml.DtdProcessing]::Prohibit
       $set.XmlResolver = $null
+      $set.MaxCharactersInDocument = $script:MaxManifestBytes
       $doc = [Xml.XmlDocument]::new()
       $doc.XmlResolver = $null
-      $s = $man[0].Open()
-      try {
-        $x = [Xml.XmlReader]::Create($s, $set)
-        try { $doc.Load($x) } finally { $x.Dispose() }
-      } finally { $s.Dispose() }
+      $manBytes.Position = 0
+      $x = [Xml.XmlReader]::Create($manBytes, $set)
+      try { $doc.Load($x) } finally { $x.Dispose() }
     } catch { throw (Hide-StoreSecret "the AppxManifest.xml in the .msix is not XML that can be read (the parser's message is not printed)") }
     [pscustomobject]@{ MsixName = $msix[0].FullName; MsixLength = $msix[0].Length; Manifest = $doc }
   } finally {
@@ -772,6 +820,9 @@ function Invoke-StoreHttp {
     [string]$Body,
     [string]$ContentType,
     [byte[]]$BodyBytes,
+    # How many bytes of BodyBytes to send, from the start (all of them when
+    # not given): Send-StorePackage sends its zip from the buffer it built it in.
+    [int]$BodyLength = -1,
     [ValidateRange(1, 3600)][int]$TimeoutSec = 600
   )
   if (-not (Test-StoreUri -Uri $Uri -Kind $Kind)) {
@@ -812,7 +863,11 @@ function Invoke-StoreHttp {
       try { $req.Headers.Add($name, $v) }
       catch { throw (New-StoreError "refused: request header $name has an invalid value (not printed); nothing was sent" -NotSent) }
     }
-    if ($PSBoundParameters.ContainsKey('BodyBytes')) { $req.Content = [System.Net.Http.ByteArrayContent]::new($BodyBytes) }
+    if ($PSBoundParameters.ContainsKey('BodyBytes')) {
+      $count = if ($BodyLength -ge 0) { $BodyLength } else { $BodyBytes.Length }
+      if ($count -gt $BodyBytes.Length) { throw (New-StoreError "refused: the body length given is more than the body bytes; nothing was sent" -NotSent) }
+      $req.Content = [System.Net.Http.ByteArrayContent]::new($BodyBytes, 0, $count)
+    }
     elseif ($PSBoundParameters.ContainsKey('Body')) { $req.Content = [System.Net.Http.ByteArrayContent]::new([System.Text.UTF8Encoding]::new($false).GetBytes($Body)) }
     # A change without a body (create, commit, DELETE) is sent with empty
     # content (Content-Length: 0, as Invoke-WebRequest sent it), so
@@ -1958,7 +2013,9 @@ function Get-SubmissionUploadUrl([string]$SubmissionJson) {
 # the zip is sent only when that SHA-256 is ExpectedSha256 (what
 # Get-StorePackage checked); otherwise nothing is sent. The file is never
 # read again and the zip is never written to disk, so the bytes sent are the
-# bytes hashed, even if the file changes while or after it is read.
+# bytes hashed, even if the file changes while or after it is read. The read
+# stops one byte past the size the file had when it was opened (at most
+# MaxPackageBytes), and the zip is sent from the buffer it was built in.
 # Prints one fixed line on success; on failure throws fixed text only.
 function Send-StorePackage {
   param([Parameter(Mandatory)][string]$UploadUrl, [Parameter(Mandatory)][string]$PackagePath, [Parameter(Mandatory)][string]$ExpectedSha256)
@@ -1968,32 +2025,45 @@ function Send-StorePackage {
   if (-not (Test-StoreUri -Uri $UploadUrl -Kind Upload)) { throw (Hide-StoreSecret "package upload refused: the upload URL is not $($script:UriRule.Upload); nothing was sent") }
   $name = Split-Path -Leaf $PackagePath
   if (-not (Test-StorePackageFileName $name)) { throw (Hide-StoreSecret "package upload refused: the package file name holds a line break, another control character or workflow command text; nothing was sent") }
-  $zip = [IO.MemoryStream]::new()
   $hash = [Security.Cryptography.SHA256]::Create()
   try {
     $src = Open-StorePackageRead $PackagePath
     try {
-      if ($src.Length -gt $script:MaxPackageBytes) { throw (Hide-StoreSecret "package upload refused: the package is larger than $($script:MaxPackageBytes) bytes, the most this action reads; nothing was sent") }
-      $z = [IO.Compression.ZipArchive]::new($zip, [IO.Compression.ZipArchiveMode]::Create, $true)
+      $len = $src.Length
+      if ($len -gt $script:MaxPackageBytes) { throw (Hide-StoreSecret "package upload refused: the package is larger than $($script:MaxPackageBytes) bytes, the most this action reads; nothing was sent") }
+      # The zip is built in one buffer, allocated before it is built and never
+      # grown or copied: room for the package, for what deflate adds to data
+      # it cannot compress (well under 1/1024 of it) and for the zip's own
+      # records (64 KiB). A zip that does not fit is refused.
+      $room = [int]($len + ($len -shr 10) + 65536)
+      $zip = [IO.MemoryStream]::new([byte[]]::new($room), 0, $room, $true, $true)
+      $zip.SetLength(0)
       try {
-        $to = $z.CreateEntry($name).Open()
+        $z = [IO.Compression.ZipArchive]::new($zip, [IO.Compression.ZipArchiveMode]::Create, $true)
         try {
-          # Writes each block to the zip entry and adds it to the hash.
-          $both = [Security.Cryptography.CryptoStream]::new($to, $hash, [Security.Cryptography.CryptoStreamMode]::Write, $true)
-          try { $src.CopyTo($both); $both.FlushFinalBlock() } finally { $both.Dispose() }
-        } finally { $to.Dispose() }
-      } finally { $z.Dispose() }
+          $to = $z.CreateEntry($name).Open()
+          try {
+            # Writes each block to the zip entry and adds it to the hash. The
+            # read is counted as it goes and stops one byte past the size the
+            # file had when it was opened.
+            $both = [Security.Cryptography.CryptoStream]::new($to, $hash, [Security.Cryptography.CryptoStreamMode]::Write, $true)
+            try {
+              if ((Copy-StoreBounded $src $both $len) -gt $len) { throw (Hide-StoreSecret "package upload refused: the package changed size while it was read; nothing was sent") }
+              $both.FlushFinalBlock()
+            } finally { $both.Dispose() }
+          } finally { $to.Dispose() }
+        } finally { $z.Dispose() }
+      } catch [NotSupportedException] { throw (Hide-StoreSecret "package upload refused: the zip did not fit in the $room bytes set aside for it; nothing was sent") }
     } finally { $src.Dispose() }
     $sha = [Convert]::ToHexString($hash.Hash).ToLowerInvariant()
   } finally { $hash.Dispose() }
   if ($sha -cne $ExpectedSha256) { throw (Hide-StoreSecret "package upload refused: the package's SHA-256 is not the one checked before (the file changed since); nothing was sent") }
-  $body = $zip.ToArray()
-  $zip.Dispose()
-  $len = $body.Length
+  # The zip is sent from the buffer it was built in.
+  $size = [int]$zip.Length
   # The CLI escapes '+' in the SAS URL the same way before uploading.
   try {
     $wait = Get-CallTimeout 600
-    $r = Invoke-StoreHttp -Method PUT -Uri $UploadUrl.Replace('+', '%2B') -Kind Upload -Headers @{ 'x-ms-blob-type' = 'BlockBlob' } -ContentType 'application/zip' -BodyBytes $body -TimeoutSec $wait
+    $r = Invoke-StoreHttp -Method PUT -Uri $UploadUrl.Replace('+', '%2B') -Kind Upload -Headers @{ 'x-ms-blob-type' = 'BlockBlob' } -ContentType 'application/zip' -BodyBytes $zip.GetBuffer() -BodyLength $size -TimeoutSec $wait
   } catch { throw (Hide-StoreSecret "package upload failed: $(Get-StoreFailureText $_)") }
   # Put Blob answers 201 with an empty body once the blob is stored, so 200,
   # 201 or 204 is success even when the body was lost (BodyLost); an error
@@ -2005,7 +2075,7 @@ function Send-StorePackage {
     throw (New-StoreError "package upload answered HTTP $($r.StatusCode): accepted, completion unconfirmed (not confirmed stored)$(if ($lost) { "; $lost" })" -OutcomeUnknown -Status $r.StatusCode)
   }
   if ($r.StatusCode -lt 200 -or $r.StatusCode -ge 300) { throw (Hide-StoreSecret "package upload failed: $(Get-StoreErrorText $r.StatusCode $r.Body)$(if ($lost) { "; $lost" })") }
-  Write-StoreHost "package uploaded: $name in Upload.zip ($len bytes), HTTP $($r.StatusCode)$(if ($lost) { " (the answer's body was not read: $lost)" })"
+  Write-StoreHost "package uploaded: $name in Upload.zip ($size bytes), HTTP $($r.StatusCode)$(if ($lost) { " (the answer's body was not read: $lost)" })"
 }
 
 # POST /applications/{productId}/submissions/{submissionId}/commit: commits

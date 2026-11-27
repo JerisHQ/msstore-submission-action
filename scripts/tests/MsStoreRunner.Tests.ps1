@@ -68,7 +68,8 @@ BeforeAll {
       $line = "$Method $(if ($Kind -eq 'Upload') { '(upload)' } else { ([uri]$Uri).AbsolutePath }) timeout=$wait"
       [void]$global:FakeStore.Calls.Add($line)
       if ($global:FakeTrace) { Write-Host "[http] $line" }
-      $bytes = if ($null -ne $BodyBytes) { $BodyBytes } elseif ($Body) { [Text.Encoding]::UTF8.GetBytes($Body) } else { [byte[]]@() }
+      # BodyLength: only that many bytes of BodyBytes are sent.
+      $bytes = if ($null -ne $BodyBytes -and $null -ne $BodyLength -and $BodyLength -ge 0) { $c = [byte[]]::new($BodyLength); [Array]::Copy($BodyBytes, $c, $BodyLength); $c } elseif ($null -ne $BodyBytes) { $BodyBytes } elseif ($Body) { [Text.Encoding]::UTF8.GetBytes($Body) } else { [byte[]]@() }
       $r = Invoke-FakeStoreRequest -Store $global:FakeStore -Method $Method -Uri $Uri -Headers $h -BodyBytes $bytes
       $took = if ($r.StatusCode -eq -1) { [int]::MaxValue } elseif ($Kind -eq 'Upload') { $global:FakeStore.UploadSeconds } else { $global:FakeStore.CallSeconds }
       if ($took -gt $wait) {
@@ -122,7 +123,9 @@ BeforeAll {
   # buffer and, once (AtEnd: when a read first finds the end of the file;
   # else: right after the first block read), writes Other over the file
   # through a second handle: from the read position on, or (AtEnd) as the
-  # whole file. Reads counts the reads, Rewinds every seek or Position set.
+  # whole file; or (Grow) appends Other to the file right after the first
+  # block read. Reads counts the reads, BytesRead the bytes they returned,
+  # Rewinds every seek or Position set.
   if (-not ('MsStoreTests.ChangingReadStream' -as [type])) {
     Add-Type -TypeDefinition @'
 namespace MsStoreTests {
@@ -131,22 +134,27 @@ namespace MsStoreTests {
     private readonly string _path;
     private readonly byte[] _other;
     private readonly bool _atEnd;
+    private readonly bool _grow;
     public int Reads;
+    public long BytesRead;
     public int Rewinds;
     public bool Changed;
-    public ChangingReadStream(string path, byte[] other, bool atEnd) {
-      _path = path; _other = other; _atEnd = atEnd;
+    public ChangingReadStream(string path, byte[] other, bool atEnd) : this(path, other, atEnd, false) { }
+    public ChangingReadStream(string path, byte[] other, bool atEnd, bool grow) {
+      _path = path; _other = other; _atEnd = atEnd; _grow = grow;
       _f = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete, 1);
     }
     public override int Read(byte[] buffer, int offset, int count) {
       int n = _f.Read(buffer, offset, count);
       Reads++;
+      BytesRead += n;
       if (!Changed && (_atEnd ? n == 0 : n > 0)) { Changed = true; Change(); }
       return n;
     }
     private void Change() {
       using (var w = new System.IO.FileStream(_path, System.IO.FileMode.Open, System.IO.FileAccess.Write, System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete)) {
-        if (_atEnd) { w.SetLength(0); w.Write(_other, 0, _other.Length); }
+        if (_grow) { w.Position = w.Length; w.Write(_other, 0, _other.Length); }
+        else if (_atEnd) { w.SetLength(0); w.Write(_other, 0, _other.Length); }
         else { w.Position = _f.Position; w.Write(_other, 0, (int)System.Math.Min(_other.Length, w.Length - _f.Position)); }
       }
     }
@@ -165,11 +173,11 @@ namespace MsStoreTests {
 '@
   }
   # Makes Open-StorePackageRead hand back a ChangingReadStream ($global:Reading)
-  # that writes $Other over the file it reads (see above).
-  function script:Use-ChangingPackageRead([byte[]]$Other, [switch]$AtEnd) {
-    $global:ChangeTo = $Other; $global:ChangeAtEnd = [bool]$AtEnd; $global:Reading = $null
+  # that writes $Other over the file it reads, or (Grow) appends it (see above).
+  function script:Use-ChangingPackageRead([byte[]]$Other, [switch]$AtEnd, [switch]$Grow) {
+    $global:ChangeTo = $Other; $global:ChangeAtEnd = [bool]$AtEnd; $global:ChangeGrow = [bool]$Grow; $global:Reading = $null
     Mock -ModuleName MsStoreRunner Open-StorePackageRead {
-      $global:Reading = [MsStoreTests.ChangingReadStream]::new($Path, $global:ChangeTo, $global:ChangeAtEnd)
+      $global:Reading = [MsStoreTests.ChangingReadStream]::new($Path, $global:ChangeTo, $global:ChangeAtEnd, $global:ChangeGrow)
       $global:Reading
     }
   }
@@ -493,6 +501,11 @@ Describe 'Test-StoreUri and Invoke-StoreHttp (where requests may go)' {
   ) {
     $r = Invoke-Captured { Invoke-StoreHttp -Method GET -Uri $Uri -Kind $Kind }
     $r.Err | Should -Match "^refused: $Kind requests go only to https://.*; nothing was sent$"
+    $r.All | Should -Not -Match $Leak
+  }
+  It 'refuses, before sending anything, a body length over the body bytes given' {
+    $r = Invoke-Captured { Invoke-StoreHttp -Method PUT -Uri 'https://fakeupload.blob.core.windows.net/blob/upload.zip?sig=FAKE+SAS' -Kind Upload -BodyBytes ([byte[]]::new(4)) -BodyLength 5 }
+    $r.Err | Should -BeExactly 'refused: the body length given is more than the body bytes; nothing was sent'
     $r.All | Should -Not -Match $Leak
   }
 }
@@ -845,6 +858,213 @@ Describe 'Format-StoreMarkdownCode (package text in the job summary)' {
     @{ Case = 'a line feed'; Text = "a`nb" }, @{ Case = 'a carriage return'; Text = "a`rb" }, @{ Case = 'U+2028'; Text = "a$([char]0x2028)b" }
   ) {
     { Format-StoreMarkdownCode $Text } | Should -Throw -ExpectedMessage 'refused: text for the job summary holds a line break or another control character'
+  }
+}
+
+# Every read of the package, of the .msix inside it and of its manifest is
+# counted as it goes and stops one byte past what it may read; together they
+# hold at most MaxPackageBytes (the manifest at most MaxManifestBytes), and the
+# zip is sent from the buffer it was built in. Some tests lower
+# MaxPackageBytes so that small files reach it.
+Describe 'Package size limits (every read counted as it goes)' {
+  BeforeAll {
+    $script:SavedMax = & (Get-Module MsStoreRunner) { $script:MaxPackageBytes }
+    function script:Set-MaxPackageBytes([long]$Max) { & (Get-Module MsStoreRunner) { param($m) $script:MaxPackageBytes = $m } $Max }
+    function script:Get-Package {
+      Get-StorePackage -Dir $Dir -ExpectedName 'Contoso.ExampleApp' -ExpectedPublisher 'CN=00000000-0000-0000-0000-000000000000' -ExpectedVersion '0.4.1.0'
+    }
+    # The bytes of a zip of Entries (Name, Bytes, Stored: no compression).
+    function script:New-ZipBytes([object[]]$Entries) {
+      $ms = [IO.MemoryStream]::new()
+      $z = [IO.Compression.ZipArchive]::new($ms, [IO.Compression.ZipArchiveMode]::Create, $true)
+      try {
+        foreach ($e in $Entries) {
+          $level = if ($e.Stored) { [IO.Compression.CompressionLevel]::NoCompression } else { [IO.Compression.CompressionLevel]::Optimal }
+          $s = $z.CreateEntry($e.Name, $level).Open()
+          try { $s.Write($e.Bytes, 0, $e.Bytes.Length) } finally { $s.Dispose() }
+        }
+      } finally { $z.Dispose() }
+      , $ms.ToArray()
+    }
+    # Makes both zip records of entry Name (its local header and its central
+    # directory record) give Size as its size. .NET writes these small zips
+    # with no zip comment, no zip64 records and no data descriptors.
+    function script:Set-ZipEntrySize([byte[]]$Zip, [string]$Name, [uint32]$Size) {
+      $end = $Zip.Length - 22
+      $at = [BitConverter]::ToUInt32($Zip, $end + 16)
+      for ($k = 0; $k -lt [BitConverter]::ToUInt16($Zip, $end + 10); $k++) {
+        $n = [BitConverter]::ToUInt16($Zip, $at + 28)
+        if ([Text.Encoding]::UTF8.GetString($Zip, $at + 46, $n) -ceq $Name) {
+          [BitConverter]::GetBytes($Size).CopyTo($Zip, $at + 24)
+          [BitConverter]::GetBytes($Size).CopyTo($Zip, [BitConverter]::ToUInt32($Zip, $at + 42) + 22)
+          return
+        }
+        $at += 46 + $n + [BitConverter]::ToUInt16($Zip, $at + 30) + [BitConverter]::ToUInt16($Zip, $at + 32)
+      }
+      throw "no zip entry $Name"
+    }
+    # Writes $Dir/$File, a .msixupload holding ExampleApp.msix, which holds
+    # AppxManifest.xml (the test identity; with ManifestSize, padded with an
+    # XML comment to exactly that many bytes) and, with Fill, Fill.bin of that
+    # many bytes (zeros, or Random), not compressed. Each entry is deflated
+    # unless Stored names it ('msix', 'manifest'). MsixSays, ManifestSays:
+    # the size that entry's zip records give instead of its own. Returns the
+    # path.
+    function script:New-SizedPackage {
+      param([int]$ManifestSize = 0, [int]$Fill = 0, [switch]$Random, [string[]]$Stored = @(), [long]$MsixSays = -1, [long]$ManifestSays = -1)
+      $head = '<?xml version="1.0" encoding="utf-8"?><Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">' +
+        '<Identity Name="Contoso.ExampleApp" Publisher="CN=00000000-0000-0000-0000-000000000000" Version="0.4.1.0" ProcessorArchitecture="x64" />'
+      $text = if ($ManifestSize) { $head + '<!--' + ('x' * ($ManifestSize - $head.Length - '<!---->'.Length - '</Package>'.Length)) + '--></Package>' } else { $head + '</Package>' }
+      $entries = @(@{ Name = 'AppxManifest.xml'; Bytes = [Text.Encoding]::UTF8.GetBytes($text); Stored = $Stored -contains 'manifest' })
+      if ($Fill) {
+        $b = [byte[]]::new($Fill); if ($Random) { [Random]::new(5).NextBytes($b) }
+        $entries += @{ Name = 'Fill.bin'; Bytes = $b; Stored = $true }
+      }
+      $inner = New-ZipBytes $entries
+      if ($ManifestSays -ge 0) { Set-ZipEntrySize $inner 'AppxManifest.xml' $ManifestSays }
+      $outer = New-ZipBytes @(@{ Name = 'ExampleApp.msix'; Bytes = $inner; Stored = $Stored -contains 'msix' })
+      if ($MsixSays -ge 0) { Set-ZipEntrySize $outer 'ExampleApp.msix' $MsixSays }
+      $p = Join-Path $Dir $File
+      [IO.File]::WriteAllBytes($p, $outer)
+      $p
+    }
+    # Size of the .msix inside the .msixupload at Path, as its zip entry gives it.
+    function script:Get-MsixSize([string]$Path) {
+      $z = [IO.Compression.ZipFile]::OpenRead($Path)
+      try { $z.Entries[0].Length } finally { $z.Dispose() }
+    }
+    $script:UploadUrl = 'https://fakeupload.blob.core.windows.net/blob/upload.zip?sv=1&sig=FAKE%2BSAS'
+    # Runs Command twice and returns what the second run returned (Value) and
+    # the bytes it allocated on this thread (Used): one-time costs, such as
+    # loading and compiling code, fall in the first run.
+    function script:Measure-Allocation([scriptblock]$Command) {
+      & $Command | Out-Null
+      $before = [GC]::GetAllocatedBytesForCurrentThread()
+      $value = & $Command
+      [pscustomobject]@{ Used = [GC]::GetAllocatedBytesForCurrentThread() - $before; Value = $value }
+    }
+  }
+  BeforeEach {
+    $script:Dir = Join-Path ([IO.Path]::GetTempPath()) ('pkgdir-' + [guid]::NewGuid().ToString('N'))
+    $script:Tmp = Join-Path ([IO.Path]::GetTempPath()) ('runner-temp-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory $Dir, $Tmp | Out-Null
+    $script:SavedTemp = $env:RUNNER_TEMP
+    $env:RUNNER_TEMP = $Tmp
+  }
+  AfterEach {
+    Set-MaxPackageBytes $SavedMax
+    $env:RUNNER_TEMP = $SavedTemp
+    Remove-Item -LiteralPath $Dir, $Tmp -Recurse -Force -ErrorAction SilentlyContinue
+  }
+
+  It 'Copy-StoreBounded reads at most one byte past its limit and writes none past it' {
+    $from = [IO.MemoryStream]::new([byte[]](1..10)); $to = [IO.MemoryStream]::new()
+    InModuleScope MsStoreRunner -Parameters @{ F = $from; T = $to } { param($F, $T) Copy-StoreBounded $F $T 4 } | Should -Be 5
+    $from.Position | Should -Be 5
+    $to.Length | Should -BeLessOrEqual 4
+    $from = [IO.MemoryStream]::new([byte[]](1..10)); $to = [IO.MemoryStream]::new()
+    InModuleScope MsStoreRunner -Parameters @{ F = $from; T = $to } { param($F, $T) Copy-StoreBounded $F $T 10 } | Should -Be 10
+    $to.ToArray() | Should -Be ([byte[]](1..10))
+  }
+  It 'Get-StorePackage refuses a package that grows past the limit while it is read, one byte past the size it had when opened' {
+    $p = New-SizedPackage
+    $len = (Get-Item -LiteralPath $p).Length
+    Set-MaxPackageBytes ($len + 100)
+    Use-ChangingPackageRead ([byte[]]::new(1MB)) -Grow
+    $r = Invoke-Captured { Get-Package }
+    $r.Err | Should -BeExactly 'the .msixupload changed size while it was read'
+    (Get-Item -LiteralPath $p).Length | Should -Be ($len + 1MB) -Because 'the file did grow past the limit'
+    $global:Reading.BytesRead | Should -Be ($len + 1) -Because 'the read stops one byte past the size the file had when it was opened'
+    @(Get-ChildItem -LiteralPath $Tmp).Count | Should -Be 0 -Because 'no copy is kept'
+  }
+  It 'Send-StorePackage refuses a package that grows past the limit while it is read, one byte past the size it had when opened, and sends nothing' {
+    $p = Join-Path $Dir $File
+    $data = [byte[]]::new(200KB); [Random]::new(11).NextBytes($data); [IO.File]::WriteAllBytes($p, $data)
+    $sha = Get-TestSha $p
+    Set-MaxPackageBytes (200KB + 100)
+    Use-ChangingPackageRead ([byte[]]::new(1MB)) -Grow
+    $s = New-FakeStore; Use-FakeStore $s
+    $r = Invoke-Captured { Send-StorePackage -UploadUrl $UploadUrl -PackagePath $p -ExpectedSha256 $sha }
+    $r.Err | Should -BeExactly 'package upload refused: the package changed size while it was read; nothing was sent'
+    (Get-Item -LiteralPath $p).Length | Should -Be (200KB + 1MB) -Because 'the file did grow past the limit'
+    $global:Reading.BytesRead | Should -Be (200KB + 1) -Because 'the read stops one byte past the size the file had when it was opened'
+    @($s.Calls).Count | Should -Be 0 -Because 'no request was sent'
+  }
+  It 'refuses an AppxManifest.xml of <Size> bytes, over the limit of 1048576 (MaxManifestBytes)' -ForEach @(
+    @{ Size = 1048577; Stored = @() }
+    @{ Size = 1048577; Stored = @('manifest') }
+    @{ Size = 4MB; Stored = @() }
+  ) {
+    New-SizedPackage -ManifestSize $Size -Stored $Stored | Out-Null
+    $r = Invoke-Captured { Get-Package }
+    $r.Err | Should -BeExactly 'the AppxManifest.xml in the .msix is larger than 1048576 bytes, the most this action reads'
+    @(Get-ChildItem -LiteralPath $Tmp).Count | Should -Be 0 -Because 'no copy is kept'
+  }
+  It 'reads an AppxManifest.xml of exactly 1048576 bytes (MaxManifestBytes)' {
+    New-SizedPackage -ManifestSize 1048576 | Out-Null
+    $r = Invoke-Captured { Get-Package }
+    $r.Err | Should -BeNullOrEmpty
+    $r.Value[-1].Version | Should -BeExactly '0.4.1.0'
+  }
+  # .NET reads a stored zip entry to its stored length, whatever size its zip
+  # records give. Reading such an entry in full would allocate at least its
+  # stored length, here 16 MiB or more (Measure-Allocation).
+  It 'refuses a stored AppxManifest.xml that holds more than its zip entry gives (here 16 MiB), one byte past that size' {
+    $p = New-SizedPackage -ManifestSize 16MB -Stored manifest -ManifestSays 100
+    $both = (Get-Item -LiteralPath $p).Length + (Get-MsixSize $p)
+    $m = Measure-Allocation { Invoke-Captured { Get-Package } }
+    $m.Value.Err | Should -BeExactly 'the AppxManifest.xml in the .msix does not have the size its zip entry gives (reading stops at that size)'
+    $m.Used | Should -BeLessThan ($both + 4MB) -Because "the .msixupload and the .msix come to $both bytes and the manifest is read to 101 bytes, not to its 16 MiB"
+    @(Get-ChildItem -LiteralPath $Tmp).Count | Should -Be 0 -Because 'no copy is kept'
+  }
+  It 'refuses a stored .msix that holds more than its zip entry gives (here 32 MiB), one byte past that size' {
+    $p = New-SizedPackage -Fill 32MB -Stored msix -MsixSays 1000
+    $len = (Get-Item -LiteralPath $p).Length
+    $m = Measure-Allocation { Invoke-Captured { Get-Package } }
+    $m.Value.Err | Should -BeExactly 'the .msix inside the .msixupload does not have the size its zip entry gives (reading stops at that size)'
+    $m.Used | Should -BeLessThan ($len + 4MB) -Because "the .msixupload is $len bytes and the .msix is read to 1001 bytes, not to its 32 MiB"
+    @(Get-ChildItem -LiteralPath $Tmp).Count | Should -Be 0 -Because 'no copy is kept'
+  }
+  # A small .msixupload whose .msix unpacks to 8 MiB of zeros: within the
+  # limit on its own, over it together with the .msixupload.
+  It 'refuses, before unpacking it, a .msix that with the .msixupload comes to more than MaxPackageBytes' {
+    $p = New-SizedPackage -Fill 8MB
+    $len = (Get-Item -LiteralPath $p).Length
+    $m = Get-MsixSize $p
+    $len | Should -BeLessThan 64KB -Because 'the .msixupload is small'
+    Set-MaxPackageBytes ($len + $m - 1)
+    $r = Invoke-Captured { Get-Package }
+    $r.Err | Should -BeExactly "the .msixupload and the .msix inside it come to more than $($len + $m - 1) bytes, the most this action holds in memory"
+    @(Get-ChildItem -LiteralPath $Tmp).Count | Should -Be 0 -Because 'no copy is kept'
+    Set-MaxPackageBytes ($len + $m)
+    $r = Invoke-Captured { Get-Package }
+    $r.Err | Should -BeNullOrEmpty
+    $r.Value[-1].Version | Should -BeExactly '0.4.1.0'
+  }
+  It 'Get-StorePackage allocates about the .msixupload and the .msix, each once' {
+    $p = New-SizedPackage -Fill 8MB -Random -Stored msix
+    $both = (Get-Item -LiteralPath $p).Length + (Get-MsixSize $p)
+    $m = Measure-Allocation { Get-Package 6>$null }
+    $m.Value.Version | Should -BeExactly '0.4.1.0'
+    $m.Used | Should -BeLessThan ($both + 4MB) -Because "the .msixupload and the .msix come to $both bytes"
+  }
+  It 'Send-StorePackage allocates about the zip once and sends it from there, not a copy' {
+    $p = Join-Path $Dir $File
+    $data = [byte[]]::new(16MB); [Random]::new(12).NextBytes($data); [IO.File]::WriteAllBytes($p, $data); $data = $null
+    $sha = Get-TestSha $p
+    $global:SentBody = $null; $global:SentLength = $null
+    Mock -ModuleName MsStoreRunner Invoke-StoreHttp {
+      $global:SentBody = $BodyBytes; $global:SentLength = $BodyLength
+      [pscustomobject]@{ StatusCode = 201; Body = '' }
+    }
+    $m = Measure-Allocation { Send-StorePackage -UploadUrl $UploadUrl -PackagePath $p -ExpectedSha256 $sha 6>$null }
+    $m.Used | Should -BeLessThan (16MB + 4MB) -Because 'the package is 16 MiB'
+    $z = [IO.Compression.ZipArchive]::new([IO.MemoryStream]::new($global:SentBody, 0, $global:SentLength))
+    try {
+      @($z.Entries).Count | Should -Be 1
+      $s = $z.Entries[0].Open(); $h = [Security.Cryptography.SHA256]::HashData($s); $s.Dispose()
+      [Convert]::ToHexString($h).ToLowerInvariant() | Should -BeExactly $sha
+    } finally { $z.Dispose() }
   }
 }
 
@@ -4331,6 +4551,9 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
     $Srv.BlobHeaders['Content-Type'] | Should -BeExactly 'application/zip'
     $Srv.BlobHeaders['User-Agent'] | Should -BeExactly 'msstore-submission-action/1.0'
     @(Get-FakeUploadedZip $Srv)[0].Name | Should -BeExactly $File
+    # Sent from the buffer the zip was built in: the zip's bytes and no more.
+    $r.Out | Should -Match ([regex]::Escape("in Upload.zip ($($Srv.Blob.Length) bytes)"))
+    [BitConverter]::ToUInt32([byte[]]$Srv.Blob, $Srv.Blob.Length - 22) | Should -Be 0x06054b50 -Because 'the blob ends with the end of central directory record'
   }
   # What differs from Invoke-WebRequest on the wire is checked in
   # the PR. These pin the parts that matter: a create or commit POST has no

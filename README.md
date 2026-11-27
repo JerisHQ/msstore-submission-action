@@ -36,13 +36,33 @@ every call after the create names this run's submission id.
 ### The package
 
 The package step reads the `.msixupload` from `package-dir` once, into
-memory (at most 2,000,000,000 bytes). Its SHA-256, the read-only copy it
-writes to a new folder under the runner's temp folder, and the manifest check
-all come from those bytes, so a file that changes while or after it is read
-cannot pass the check with other content. The upload reads that copy once
-more, in one pass: each block goes into the zip entry and into the SHA-256
-together, and the zip (built in memory, never written to disk) is sent only
-when that SHA-256 is the checked one. On any other, nothing is sent.
+memory. Its SHA-256, the read-only copy it writes to a new folder under the
+runner's temp folder, and the manifest check all come from those bytes, so a
+file that changes while or after it is read cannot pass the check with other
+content. The upload reads that copy once more, in one pass: each block goes
+into the zip entry and into the SHA-256 together, and the zip (built in
+memory, never written to disk) is sent only when that SHA-256 is the checked
+one. On any other, nothing is sent.
+
+Every read of package bytes is counted as it goes and stops one byte past
+its limit, so a file that grows, or a zip entry that holds more than its
+entry gives, is refused without being read further:
+
+- The package step holds the `.msixupload` and the `.msix` unpacked from
+  it in memory, the two together at most 2,000,000,000 bytes. A
+  `.msixupload` whose `.msix` is about as large as itself can be at most
+  about 1,000,000,000 bytes.
+- It reads at most 1,048,576 bytes of `AppxManifest.xml`, and parses at
+  most as many characters.
+- The upload holds the package once, in the zip it sends: one buffer of the
+  package size plus 1/1024 plus 64 KiB, set aside before the zip is built and
+  sent from there with no other copy.
+
+These limits count package bytes only, not the memory PowerShell and .NET
+use besides. Measured on Linux (PowerShell 7.6, .NET 10) with a 210 MB
+`.msixupload` holding a `.msix` of about the same size, peak memory rose by
+about 2.1 times the `.msixupload` in the package step and about 1.1 times in
+the upload.
 
 A file name or manifest identity field with a line break or another control
 character stops the run before any output is written, and so does a file name
