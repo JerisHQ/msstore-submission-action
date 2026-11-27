@@ -873,6 +873,11 @@ Describe 'Package size limits (every read counted as it goes)' {
     $script:NetChecksEntryLength = [Environment]::Version.Major -ge 11
     $script:UnpackError = "the .msix inside the .msixupload is not a zip archive that can be read (the reader's message is not printed)"
     function script:Set-MaxPackageBytes([long]$Max) { & (Get-Module MsStoreRunner) { param($m) $script:MaxPackageBytes = $m } $Max }
+    # The zip limits: MaxZipEntries, MaxZipDirectoryBytes.
+    $script:SavedZipLimits = & (Get-Module MsStoreRunner) { $script:MaxZipEntries, $script:MaxZipDirectoryBytes }
+    function script:Set-ZipLimits([long]$Entries, [long]$Bytes) {
+      & (Get-Module MsStoreRunner) { param($e, $b) $script:MaxZipEntries = $e; $script:MaxZipDirectoryBytes = $b } $Entries $Bytes
+    }
     function script:Get-Package {
       Get-StorePackage -Dir $Dir -ExpectedName 'Contoso.ExampleApp' -ExpectedPublisher 'CN=00000000-0000-0000-0000-000000000000' -ExpectedVersion '0.4.1.0'
     }
@@ -911,10 +916,13 @@ Describe 'Package size limits (every read counted as it goes)' {
     # XML comment to exactly that many bytes) and, with Fill, Fill.bin of that
     # many bytes (zeros, or Random), not compressed. Each entry is deflated
     # unless Stored names it ('msix', 'manifest'). MsixSays, ManifestSays:
-    # the size that entry's zip records give instead of its own. Returns the
-    # path.
+    # the size that entry's zip records give instead of its own. OuterExtra,
+    # InnerExtra: that many more one-byte entries (Extra1.bin, ...) at the
+    # root of the .msixupload, or of the .msix. Zip64: both zips end with zip64
+    # end records (ConvertTo-Zip64Bytes). Returns the path.
     function script:New-SizedPackage {
-      param([int]$ManifestSize = 0, [int]$Fill = 0, [switch]$Random, [string[]]$Stored = @(), [long]$MsixSays = -1, [long]$ManifestSays = -1)
+      param([int]$ManifestSize = 0, [int]$Fill = 0, [switch]$Random, [string[]]$Stored = @(), [long]$MsixSays = -1, [long]$ManifestSays = -1,
+        [int]$OuterExtra = 0, [int]$InnerExtra = 0, [switch]$Zip64)
       $head = '<?xml version="1.0" encoding="utf-8"?><Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">' +
         '<Identity Name="Contoso.ExampleApp" Publisher="CN=00000000-0000-0000-0000-000000000000" Version="0.4.1.0" ProcessorArchitecture="x64" />'
       $text = if ($ManifestSize) { $head + '<!--' + ('x' * ($ManifestSize - $head.Length - '<!---->'.Length - '</Package>'.Length)) + '--></Package>' } else { $head + '</Package>' }
@@ -923,10 +931,15 @@ Describe 'Package size limits (every read counted as it goes)' {
         $b = [byte[]]::new($Fill); if ($Random) { [Random]::new(5).NextBytes($b) }
         $entries += @{ Name = 'Fill.bin'; Bytes = $b; Stored = $true }
       }
+      for ($k = 1; $k -le $InnerExtra; $k++) { $entries += @{ Name = "Extra$k.bin"; Bytes = [byte[]]@(1); Stored = $true } }
       $inner = New-ZipBytes $entries
       if ($ManifestSays -ge 0) { Set-ZipEntrySize $inner 'AppxManifest.xml' $ManifestSays }
-      $outer = New-ZipBytes @(@{ Name = 'ExampleApp.msix'; Bytes = $inner; Stored = $Stored -contains 'msix' })
+      if ($Zip64) { $inner = ConvertTo-Zip64Bytes $inner }
+      $entries = @(@{ Name = 'ExampleApp.msix'; Bytes = $inner; Stored = $Stored -contains 'msix' })
+      for ($k = 1; $k -le $OuterExtra; $k++) { $entries += @{ Name = "Extra$k.bin"; Bytes = [byte[]]@(1); Stored = $true } }
+      $outer = New-ZipBytes $entries
       if ($MsixSays -ge 0) { Set-ZipEntrySize $outer 'ExampleApp.msix' $MsixSays }
+      if ($Zip64) { $outer = ConvertTo-Zip64Bytes $outer }
       $p = Join-Path $Dir $File
       [IO.File]::WriteAllBytes($p, $outer)
       $p
@@ -935,6 +948,70 @@ Describe 'Package size limits (every read counted as it goes)' {
     function script:Get-MsixSize([string]$Path) {
       $z = [IO.Compression.ZipFile]::OpenRead($Path)
       try { $z.Entries[0].Length } finally { $z.Dispose() }
+    }
+    # The bytes of the .msix inside the .msixupload at Path.
+    function script:Get-MsixBytes([string]$Path) {
+      $z = [IO.Compression.ZipFile]::OpenRead($Path)
+      try {
+        $ms = [IO.MemoryStream]::new(); $s = $z.Entries[0].Open()
+        try { $s.CopyTo($ms) } finally { $s.Dispose() }
+        , $ms.ToArray()
+      } finally { $z.Dispose() }
+    }
+    # The central directory size the end record of Zip gives (a zip New-ZipBytes
+    # wrote: no zip comment, no zip64 records).
+    function script:Get-ZipDirectorySize([byte[]]$Zip) { [BitConverter]::ToUInt32($Zip, $Zip.Length - 10) }
+    # The 98 bytes that end a zip whose end record leaves its entry count,
+    # directory size and offset to a zip64 end record: the zip64 end record
+    # (at RecordAt, giving Listed, Declared and Start), its locator, and an end
+    # record whose counts are 0xFFFF and size and offset 0xFFFFFFFF.
+    function script:Get-Zip64EndBytes([uint64]$Listed, [uint64]$Declared, [uint64]$Start, [uint64]$RecordAt) {
+      $b = [byte[]]::new(98)
+      ([byte[]](0x50, 0x4B, 6, 6)).CopyTo($b, 0)
+      [BitConverter]::GetBytes([uint64]44).CopyTo($b, 4)
+      [BitConverter]::GetBytes([uint16]45).CopyTo($b, 12); [BitConverter]::GetBytes([uint16]45).CopyTo($b, 14)
+      [BitConverter]::GetBytes($Listed).CopyTo($b, 24); [BitConverter]::GetBytes($Listed).CopyTo($b, 32)
+      [BitConverter]::GetBytes($Declared).CopyTo($b, 40); [BitConverter]::GetBytes($Start).CopyTo($b, 48)
+      ([byte[]](0x50, 0x4B, 6, 7)).CopyTo($b, 56)
+      [BitConverter]::GetBytes($RecordAt).CopyTo($b, 64); [BitConverter]::GetBytes([uint32]1).CopyTo($b, 72)
+      ([byte[]](0x50, 0x4B, 5, 6)).CopyTo($b, 76)
+      [BitConverter]::GetBytes([uint16]::MaxValue).CopyTo($b, 84); [BitConverter]::GetBytes([uint16]::MaxValue).CopyTo($b, 86)
+      [BitConverter]::GetBytes([uint32]::MaxValue).CopyTo($b, 88); [BitConverter]::GetBytes([uint32]::MaxValue).CopyTo($b, 92)
+      , $b
+    }
+    # Zip (a zip New-ZipBytes wrote) ending the way MSIX packaging tools end a
+    # .msix: zip64 end records give its entry count, directory size and offset.
+    function script:ConvertTo-Zip64Bytes([byte[]]$Zip) {
+      $end = $Zip.Length - 22
+      $ms = [IO.MemoryStream]::new()
+      $ms.Write($Zip, 0, $end)
+      $tail = Get-Zip64EndBytes ([BitConverter]::ToUInt16($Zip, $end + 10)) ([BitConverter]::ToUInt32($Zip, $end + 12)) ([BitConverter]::ToUInt32($Zip, $end + 16)) $end
+      $ms.Write($tail, 0, $tail.Length)
+      , $ms.ToArray()
+    }
+    # A zip that is only a central directory, at offset 0: Count records
+    # ("PK 1 2", 46 bytes, the name e.bin, CommentLength bytes of comment; no
+    # file data), then an end record giving Listed entries (default Count) and
+    # a directory of Declared bytes (default the records' size), or (Zip64) a
+    # zip64 end record giving them, as for more than 65,534 entries.
+    function script:New-ZipDirectoryBytes([int]$Count, [int]$CommentLength = 0, [long]$Listed = -1, [long]$Declared = -1, [switch]$Zip64) {
+      $one = [byte[]]::new(46 + 5 + $CommentLength)
+      ([byte[]](0x50, 0x4B, 1, 2)).CopyTo($one, 0)
+      [BitConverter]::GetBytes([uint16]5).CopyTo($one, 28)
+      [BitConverter]::GetBytes([uint16]$CommentLength).CopyTo($one, 32)
+      [Text.Encoding]::ASCII.GetBytes('e.bin').CopyTo($one, 46)
+      if ($Listed -lt 0) { $Listed = $Count }
+      if ($Declared -lt 0) { $Declared = [long]$one.Length * $Count }
+      $ms = [IO.MemoryStream]::new()
+      for ($k = 0; $k -lt $Count; $k++) { $ms.Write($one, 0, $one.Length) }
+      if ($Zip64) { $end = Get-Zip64EndBytes $Listed $Declared 0 $ms.Length }
+      else {
+        $end = [byte[]]::new(22); ([byte[]](0x50, 0x4B, 5, 6)).CopyTo($end, 0)
+        [BitConverter]::GetBytes([uint16]$Listed).CopyTo($end, 8); [BitConverter]::GetBytes([uint16]$Listed).CopyTo($end, 10)
+        [BitConverter]::GetBytes([uint32]$Declared).CopyTo($end, 12)
+      }
+      $ms.Write($end, 0, $end.Length)
+      , $ms.ToArray()
     }
     $script:UploadUrl = 'https://fakeupload.blob.core.windows.net/blob/upload.zip?sv=1&sig=FAKE%2BSAS'
     # Runs Command twice and returns what the second run returned (Value) and
@@ -956,6 +1033,7 @@ Describe 'Package size limits (every read counted as it goes)' {
   }
   AfterEach {
     Set-MaxPackageBytes $SavedMax
+    Set-ZipLimits $SavedZipLimits[0] $SavedZipLimits[1]
     $env:RUNNER_TEMP = $SavedTemp
     Remove-Item -LiteralPath $Dir, $Tmp -Recurse -Force -ErrorAction SilentlyContinue
   }
@@ -1073,6 +1151,123 @@ Describe 'Package size limits (every read counted as it goes)' {
       $s = $z.Entries[0].Open(); $h = [Security.Cryptography.SHA256]::HashData($s); $s.Dispose()
       [Convert]::ToHexString($h).ToLowerInvariant() | Should -BeExactly $sha
     } finally { $z.Dispose() }
+  }
+
+  # The SHA-256 Publish-StoreSubmission checks before it creates a draft
+  # (Get-StorePackageSha256): one counted read, like every other.
+  It 'Publish-StoreSubmission refuses a package larger than MaxPackageBytes before it hashes a byte of it, and sends nothing' {
+    $p = Join-Path $Dir $File
+    $data = [byte[]]::new(200KB); [Random]::new(13).NextBytes($data); [IO.File]::WriteAllBytes($p, $data)
+    $sha = Get-TestSha $p
+    Set-MaxPackageBytes (200KB - 1)
+    Use-ChangingPackageRead ([byte[]]@())
+    $s = New-FakeStore; Use-FakeStore $s
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $p -ExpectedSha256 $sha -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
+    $r.Err | Should -BeExactly "not publishing: the package is larger than $(200KB - 1) bytes, the most this action reads; nothing was sent"
+    $global:Reading.Reads | Should -Be 0 -Because 'the size is checked once the file is open, before any read'
+    @($s.Calls).Count | Should -Be 0 -Because 'no request was sent'
+  }
+  It 'Publish-StoreSubmission refuses a package that grows while its SHA-256 is taken, one byte past the size it had when opened, and sends nothing' {
+    $p = Join-Path $Dir $File
+    $data = [byte[]]::new(200KB); [Random]::new(14).NextBytes($data); [IO.File]::WriteAllBytes($p, $data)
+    $sha = Get-TestSha $p
+    Set-MaxPackageBytes (200KB + 100)
+    Use-ChangingPackageRead ([byte[]]::new(1MB)) -Grow
+    $s = New-FakeStore; Use-FakeStore $s
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $p -ExpectedSha256 $sha -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
+    $r.Err | Should -BeExactly 'not publishing: the package changed size while it was read; nothing was sent'
+    (Get-Item -LiteralPath $p).Length | Should -Be (200KB + 1MB) -Because 'the file did grow past the limit'
+    $global:Reading.BytesRead | Should -Be (200KB + 1) -Because 'the read stops one byte past the size the file had when it was opened'
+    @($s.Calls).Count | Should -Be 0 -Because 'no request was sent'
+  }
+  It 'Publish-StoreSubmission takes the SHA-256 one block at a time, not holding the package (here 16 MiB)' {
+    $p = Join-Path $Dir $File
+    $data = [byte[]]::new(16MB); [Random]::new(15).NextBytes($data); [IO.File]::WriteAllBytes($p, $data); $data = $null
+    $m = Measure-Allocation { & (Get-Module MsStoreRunner) { param($x) Get-StorePackageSha256 $x } $p }
+    $m.Value | Should -BeExactly (Get-TestSha $p)
+    $m.Used | Should -BeLessThan 4MB -Because 'the package is 16 MiB'
+  }
+
+  # The central directory of each zip is checked before ZipArchive lists its
+  # entries (Assert-StoreZipDirectory): listing builds an object for every
+  # entry, with its name and comment. These errors are the check's own; had
+  # ZipArchive listed the entries first, the run would stop with another.
+  It 'refuses <What> of more than MaxZipEntries zip entries (here 8), and reads one of exactly 8' -ForEach @(
+    @{ What = 'the .msixupload'; Over = @{ OuterExtra = 8 }; At = @{ OuterExtra = 7 } }
+    @{ What = 'the .msix inside the .msixupload'; Over = @{ InnerExtra = 8 }; At = @{ InnerExtra = 7 } }
+  ) {
+    Set-ZipLimits 8 $SavedZipLimits[1]
+    New-SizedPackage @Over | Out-Null
+    $r = Invoke-Captured { Get-Package }
+    $r.Err | Should -BeExactly "$What has more than 8 zip entries, the most this action reads"
+    @(Get-ChildItem -LiteralPath $Tmp).Count | Should -Be 0 -Because 'no copy is kept'
+    New-SizedPackage @At | Out-Null
+    $r = Invoke-Captured { Get-Package }
+    $r.Err | Should -BeNullOrEmpty
+    $r.Value[-1].Version | Should -BeExactly '0.4.1.0'
+  }
+  It 'refuses <What> with a zip central directory of more than MaxZipDirectoryBytes (here its size - 1), and reads it at exactly its size' -ForEach @(
+    @{ What = 'the .msixupload'; Shape = @{ OuterExtra = 6 }; Inner = $false }
+    @{ What = 'the .msix inside the .msixupload'; Shape = @{ InnerExtra = 6 }; Inner = $true }
+  ) {
+    $p = New-SizedPackage @Shape
+    $outer = [IO.File]::ReadAllBytes($p); $msix = Get-MsixBytes $p
+    $size = if ($Inner) { Get-ZipDirectorySize $msix } else { Get-ZipDirectorySize $outer }
+    $other = if ($Inner) { Get-ZipDirectorySize $outer } else { Get-ZipDirectorySize $msix }
+    $other | Should -BeLessThan $size -Because 'only this zip is over the limit'
+    Set-ZipLimits $SavedZipLimits[0] ($size - 1)
+    $r = Invoke-Captured { Get-Package }
+    $r.Err | Should -BeExactly "$What has a zip central directory of more than $($size - 1) bytes, the most this action reads"
+    @(Get-ChildItem -LiteralPath $Tmp).Count | Should -Be 0 -Because 'no copy is kept'
+    Set-ZipLimits $SavedZipLimits[0] $size
+    $r = Invoke-Captured { Get-Package }
+    $r.Err | Should -BeNullOrEmpty
+    $r.Value[-1].Version | Should -BeExactly '0.4.1.0'
+  }
+  It 'the zip limits default to 65535 entries and 16777216 bytes of central directory' {
+    $SavedZipLimits[0] | Should -Be 65535
+    $SavedZipLimits[1] | Should -Be 16777216
+  }
+  # .msixupload files that are only a central directory (New-ZipDirectoryBytes).
+  It 'refuses a .msixupload of <Case>, over the default 65535 entries' -ForEach @(
+    @{ Case = '65536 entries its zip64 end record lists'; Zip = @{ Count = 65536; Zip64 = $true } }
+    @{ Case = '65536 directory records where its end record lists 1'; Zip = @{ Count = 65536; Listed = 1; Declared = 51 } }
+  ) {
+    [IO.File]::WriteAllBytes((Join-Path $Dir $File), (New-ZipDirectoryBytes @Zip))
+    $r = Invoke-Captured { Get-Package }
+    $r.Err | Should -BeExactly 'the .msixupload has more than 65535 zip entries, the most this action reads'
+    @(Get-ChildItem -LiteralPath $Tmp).Count | Should -Be 0 -Because 'no copy is kept'
+  }
+  It 'refuses a .msixupload whose central directory <Case>, over the default 16777216 bytes' -ForEach @(
+    @{ Case = 'runs to 16790016 bytes where its end record gives 100'; Zip = @{ Count = 256; CommentLength = 65535; Declared = 100 } }
+    @{ Case = 'is given as 16777217 bytes'; Zip = @{ Count = 1; Declared = 16777217 } }
+  ) {
+    [IO.File]::WriteAllBytes((Join-Path $Dir $File), (New-ZipDirectoryBytes @Zip))
+    $r = Invoke-Captured { Get-Package }
+    $r.Err | Should -BeExactly 'the .msixupload has a zip central directory of more than 16777216 bytes, the most this action reads'
+    @(Get-ChildItem -LiteralPath $Tmp).Count | Should -Be 0 -Because 'no copy is kept'
+  }
+  It 'reads a package whose .msixupload and .msix end with zip64 end records, as MSIX packaging tools end a .msix' {
+    $p = New-SizedPackage -Zip64 -OuterExtra 2 -InnerExtra 2
+    $r = Invoke-Captured { Get-Package }
+    $r.Err | Should -BeNullOrEmpty
+    $r.Value[-1].Version | Should -BeExactly '0.4.1.0'
+    foreach ($zip in @(, [IO.File]::ReadAllBytes($p)) + @(, (Get-MsixBytes $p))) {
+      [BitConverter]::ToUInt32($zip, $zip.Length - 6) | Should -Be ([uint32]::MaxValue) -Because 'the end record leaves the offset to the zip64 end record'
+      $d = & (Get-Module MsStoreRunner) { param($z) Measure-StoreZipDirectory $z } ([IO.MemoryStream]::new($zip))
+      $d.Entries | Should -Be 3
+      $d.Listed | Should -Be 3
+      $d.Bytes | Should -Be $d.Declared
+    }
+  }
+  It 'refuses, as a zip that cannot be read, a .msixupload <Case>' -ForEach @(
+    @{ Case = 'with no end record'; Zip = $null }
+    @{ Case = 'whose end record lists 4 entries and its directory has 3'; Zip = @{ Count = 3; Listed = 4 } }
+  ) {
+    $bytes = if ($Zip) { New-ZipDirectoryBytes @Zip } else { [byte[]](1..200) }
+    [IO.File]::WriteAllBytes((Join-Path $Dir $File), $bytes)
+    $r = Invoke-Captured { Get-Package }
+    $r.Err | Should -BeExactly "the .msixupload is not a zip archive that can be read (the reader's message is not printed)"
   }
 }
 

@@ -39,7 +39,8 @@ The package step reads the `.msixupload` from `package-dir` once, into
 memory. Its SHA-256, the read-only copy it writes to a new folder under the
 runner's temp folder, and the manifest check all come from those bytes, so a
 file that changes while or after it is read cannot pass the check with other
-content. The upload reads that copy once more, in one pass: each block goes
+content. The publish step reads that copy twice: once to check its SHA-256
+before it creates a draft, then in the upload, in one pass: each block goes
 into the zip entry and into the SHA-256 together, and the zip (built in
 memory, never written to disk) is sent only when that SHA-256 is the checked
 one. On any other, nothing is sent.
@@ -54,9 +55,25 @@ entry gives, is refused without being read further:
   about 1,000,000,000 bytes.
 - It reads at most 1,048,576 bytes of `AppxManifest.xml`, and parses at
   most as many characters.
+- The publish step's SHA-256 check reads at most the size the copy had when
+  it was opened, itself at most 2,000,000,000 bytes, and holds one 80 KiB
+  block at a time.
 - The upload holds the package once, in the zip it sends: one buffer of the
   package size plus 1/1024 plus 64 KiB, set aside before the zip is built and
   sent from there with no other copy.
+
+Before the entries of the `.msixupload`, or of the `.msix` inside it, are
+listed, the package step finds that zip's central directory where .NET looks
+for it (the end record, or the zip64 end record it points to) and walks it
+record by record, reading 46 bytes of each. It refuses a zip with more than
+65,535 entries, or with more than 16,777,216 bytes (16 MiB) of central
+directory, whether its end record gives that or its records run that far.
+A zip whose central directory is not found that way, or whose records are
+not as many as its end record gives, is refused as a zip that cannot be
+read. Listing a zip's entries keeps an object for each, with its name and
+comment: measured on Linux with 65,535 entries and 16 MiB of names, .NET
+kept about 67 MB (PowerShell 7.7.0, .NET 11) and 61 MB (PowerShell 7.6.10,
+.NET 10) for that one zip.
 
 These limits count package bytes only, not the memory PowerShell and .NET
 use besides. Measured on Linux (PowerShell 7.6, .NET 10) with a 210 MB

@@ -117,12 +117,21 @@ $script:DeleteOnlySent = $false
 # 2 GiB). Get-StorePackage holds the .msixupload and the .msix unpacked from
 # it, together at most this many bytes; Send-StorePackage reads a package of
 # at most this many bytes and holds the zip it sends, in a buffer of a size
-# set before it is built (Send-StorePackage). Every read is counted as it goes
+# set before it is built (Send-StorePackage); Publish-StoreSubmission hashes a
+# package of at most this many bytes, one block at a time
+# (Get-StorePackageSha256). Every read is counted as it goes
 # (Copy-StoreBounded) and stops one byte past what it may read.
 $script:MaxPackageBytes = 2000000000
 # The most bytes of AppxManifest.xml read, and the most characters its parser
 # reads (with no DTD there are no more characters than bytes).
 $script:MaxManifestBytes = 1048576
+# The most entries, and the most bytes of central directory, a zip (the
+# .msixupload, and the .msix inside it) may have (Assert-StoreZipDirectory).
+# .NET builds an object for every entry, with its name and comment, the first
+# time a zip's entries are listed, before any is picked; within
+# MaxPackageBytes that could come to far more memory than the package itself.
+$script:MaxZipEntries = 65535
+$script:MaxZipDirectoryBytes = 16777216
 
 # Finds the one Store package in $Dir, copies it and checks its identity and
 # version. Returns Path (the copy, which is what gets uploaded), FileName,
@@ -246,9 +255,13 @@ function Copy-StoreBounded([IO.Stream]$From, [IO.Stream]$To, [long]$Limit) {
 # before it is unpacked and read to that size, never past it: .NET stops a
 # deflated entry at that size but reads a stored one to its stored length, so
 # an entry holding more than its zip entry gives is refused one byte past it.
+# Before the entries of either zip are listed, its central directory is
+# checked against MaxZipEntries and MaxZipDirectoryBytes
+# (Assert-StoreZipDirectory).
 function Read-StorePackageManifest([Parameter(Mandatory)][IO.MemoryStream]$Package) {
   $outer = $null; $inner = $null; $msixBytes = $null
   try {
+    Assert-StoreZipDirectory $Package 'the .msixupload'
     try {
       $Package.Position = 0
       $outer = [IO.Compression.ZipArchive]::new($Package, [IO.Compression.ZipArchiveMode]::Read, $true)
@@ -263,6 +276,7 @@ function Read-StorePackageManifest([Parameter(Mandatory)][IO.MemoryStream]$Packa
       try { $got = Copy-StoreBounded $s $msixBytes $size } finally { $s.Dispose() }
     } catch { throw (Hide-StoreSecret "the .msix inside the .msixupload is not a zip archive that can be read (the reader's message is not printed)") }
     if ($got -ne $size) { throw (Hide-StoreSecret "the .msix inside the .msixupload does not have the size its zip entry gives (reading stops at that size)") }
+    Assert-StoreZipDirectory $msixBytes 'the .msix inside the .msixupload'
     try {
       $msixBytes.Position = 0
       $inner = [IO.Compression.ZipArchive]::new($msixBytes, [IO.Compression.ZipArchiveMode]::Read, $true)
@@ -296,9 +310,117 @@ function Read-StorePackageManifest([Parameter(Mandatory)][IO.MemoryStream]$Packa
   }
 }
 
-# SHA-256 of a file, lower-case hex.
-function Get-StoreFileSha256([Parameter(Mandatory)][string]$Path) {
-  (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+# Refuses a zip (Zip, held in memory; What names it in the error text, fixed
+# text only) with more than MaxZipEntries entries or a central directory of
+# more than MaxZipDirectoryBytes, before ZipArchive lists its entries. Also
+# refuses, as a zip that cannot be read, one whose central directory
+# Measure-StoreZipDirectory cannot find or whose entry count is not the one
+# its end record gives (ZipArchive refuses that too), so ZipArchive never
+# lists a directory that was not counted here.
+function Assert-StoreZipDirectory([Parameter(Mandatory)][IO.Stream]$Zip, [Parameter(Mandatory)][string]$What) {
+  $d = $null
+  try { $d = Measure-StoreZipDirectory $Zip } catch { $d = $null }
+  if (-not $d) { throw (Hide-StoreSecret "$What is not a zip archive that can be read (the reader's message is not printed)") }
+  if ($d.Listed -gt $script:MaxZipEntries -or $d.Entries -gt $script:MaxZipEntries) { throw (Hide-StoreSecret "$What has more than $($script:MaxZipEntries) zip entries, the most this action reads") }
+  if ($d.Declared -gt $script:MaxZipDirectoryBytes -or $d.Bytes -gt $script:MaxZipDirectoryBytes) { throw (Hide-StoreSecret "$What has a zip central directory of more than $($script:MaxZipDirectoryBytes) bytes, the most this action reads") }
+  if ($d.Entries -ne $d.Listed) { throw (Hide-StoreSecret "$What is not a zip archive that can be read (the reader's message is not printed)") }
+}
+
+# Finds a zip's central directory where System.IO.Compression.ZipArchive
+# looks for it (ReadEndOfCentralDirectory, .NET 8 to 11) and walks it the way
+# ZipArchive does the first time its entries are listed. Returns Listed and
+# Declared (the entry count and directory size the end record gives), and
+# Entries and Bytes (the records walked and the bytes they take), or $null
+# when there is no directory to walk.
+#
+# The end record is the last "PK 5 6" signature that starts 22 to 65,557
+# bytes before the end of the zip. When its disk number or entry count is
+# 0xFFFF or its directory offset is 0xFFFFFFFF, and the 20 bytes right before
+# it are a zip64 locator, the zip64 end record the locator points to gives the
+# count, size and offset instead. ZipArchive then reads central directory
+# records ("PK 1 2", 46 bytes, then the name, extra field and comment) one
+# after another from that offset until one does not start with that signature
+# or does not fit in the zip; it does not stop at the size the end record
+# gives, so neither does this walk. The walk stops one record past
+# MaxZipEntries, or at the first record that ends past MaxZipDirectoryBytes
+# (then Bytes is where that record ends). Besides the last 65,557 bytes of the
+# zip, it reads 46 bytes a record, holding 46 at a time.
+function Measure-StoreZipDirectory([Parameter(Mandatory)][IO.Stream]$Zip) {
+  $len = $Zip.Length
+  if ($len -lt 22) { return $null }
+  $tailLen = [int][Math]::Min($len, 65557)
+  $tail = Read-StoreZipBytes $Zip ($len - $tailLen) $tailLen
+  # Latin-1 maps each byte to the char of the same value. The search starts
+  # at the last char an end record starting 22 bytes before the end could
+  # hold its signature in, and goes back.
+  $at = [Text.Encoding]::Latin1.GetString($tail).LastIndexOf("PK$([char]5)$([char]6)", $tailLen - 19, [StringComparison]::Ordinal)
+  if ($at -lt 0) { return $null }
+  if ($at + 22 + [BitConverter]::ToUInt16($tail, $at + 20) -gt $tailLen) { return $null }
+  $endAt = $len - $tailLen + $at
+  $disk = [BitConverter]::ToUInt16($tail, $at + 4)
+  [uint64]$listed = [BitConverter]::ToUInt16($tail, $at + 10)
+  [uint64]$declared = [BitConverter]::ToUInt32($tail, $at + 12)
+  [uint64]$start = [BitConverter]::ToUInt32($tail, $at + 16)
+  # [uint16]::MaxValue and [uint32]::MaxValue: in PowerShell 0xFFFFFFFF is the
+  # Int32 -1, which no [uint64] equals.
+  if (($disk -eq [uint16]::MaxValue -or $listed -eq [uint16]::MaxValue -or $start -eq [uint32]::MaxValue) -and $endAt -ge 20) {
+    $loc = Read-StoreZipBytes $Zip ($endAt - 20) 20
+    if ($loc[0] -eq 0x50 -and $loc[1] -eq 0x4B -and $loc[2] -eq 6 -and $loc[3] -eq 7) {
+      $recAt = [BitConverter]::ToUInt64($loc, 8)
+      if ($len -lt 56 -or $recAt -gt [uint64]($len - 56)) { return $null }
+      $rec = Read-StoreZipBytes $Zip ([long]$recAt) 56
+      if (-not ($rec[0] -eq 0x50 -and $rec[1] -eq 0x4B -and $rec[2] -eq 6 -and $rec[3] -eq 6)) { return $null }
+      $listed = [BitConverter]::ToUInt64($rec, 32)
+      if ($listed -ne [BitConverter]::ToUInt64($rec, 24)) { return $null }
+      $declared = [BitConverter]::ToUInt64($rec, 40)
+      $start = [BitConverter]::ToUInt64($rec, 48)
+    }
+  }
+  if ($start -gt [uint64]$len) { return $null }
+  $avail = $len - [long]$start
+  $max = [long]$script:MaxZipDirectoryBytes
+  $head = [byte[]]::new(46)
+  [long]$p = 0; [long]$n = 0
+  # Only the 46 fixed bytes of each record are read, into one buffer; its
+  # name, extra field and comment are stepped over.
+  while ($p + 46 -le $avail) {
+    $Zip.Position = [long]$start + $p
+    $Zip.ReadExactly($head, 0, 46)
+    if (-not ($head[0] -eq 0x50 -and $head[1] -eq 0x4B -and $head[2] -eq 1 -and $head[3] -eq 2)) { break }
+    $next = $p + 46 + [BitConverter]::ToUInt16($head, 28) + [BitConverter]::ToUInt16($head, 30) + [BitConverter]::ToUInt16($head, 32)
+    if ($next -gt $avail) { break }
+    $p = $next; $n++
+    if ($p -gt $max -or $n -gt $script:MaxZipEntries) { break }
+  }
+  [pscustomobject]@{ Listed = $listed; Declared = $declared; Entries = $n; Bytes = $p }
+}
+
+# Reads exactly Count bytes of Zip from At on.
+function Read-StoreZipBytes([IO.Stream]$Zip, [long]$At, [int]$Count) {
+  $b = [byte[]]::new($Count)
+  $Zip.Position = $At
+  $Zip.ReadExactly($b, 0, $Count)
+  , $b
+}
+
+# SHA-256 of the package at Path, lower-case hex, for Publish-StoreSubmission
+# to check before it creates a draft. One read (Open-StorePackageRead), each
+# block hashed as it is read and counted (Copy-StoreBounded): at most the size
+# the file had when it was opened, itself at most MaxPackageBytes; one byte
+# more refuses it with nothing more read. One block is held at a time.
+function Get-StorePackageSha256([Parameter(Mandatory)][string]$Path) {
+  $hash = [Security.Cryptography.SHA256]::Create()
+  try {
+    $src = Open-StorePackageRead $Path
+    try {
+      $len = $src.Length
+      if ($len -gt $script:MaxPackageBytes) { throw (Hide-StoreSecret "not publishing: the package is larger than $($script:MaxPackageBytes) bytes, the most this action reads; nothing was sent") }
+      $sink = [Security.Cryptography.CryptoStream]::new([IO.Stream]::Null, $hash, [Security.Cryptography.CryptoStreamMode]::Write, $true)
+      try { $got = Copy-StoreBounded $src $sink $len } finally { $sink.Dispose() }
+    } finally { $src.Dispose() }
+    if ($got -ne $len) { throw (Hide-StoreSecret "not publishing: the package changed size while it was read; nothing was sent") }
+    [Convert]::ToHexString($hash.Hash).ToLowerInvariant()
+  } finally { $hash.Dispose() }
 }
 
 # True when Text holds no control or format character and no line or
@@ -2442,7 +2564,7 @@ function Publish-StoreSubmission {
   # The package must still be the one Get-StorePackage checked; Send-StorePackage
   # checks it again on the bytes it zips, in the same read.
   if ($ExpectedSha256 -cnotmatch '^[0-9a-f]{64}\z') { throw (Hide-StoreSecret "not publishing: the expected SHA-256 is not 64 lower-case hex digits; nothing was sent") }
-  if ((Get-StoreFileSha256 $PackagePath) -cne $ExpectedSha256) { throw (Hide-StoreSecret "not publishing: the package's SHA-256 is not the one checked before (the file changed since); nothing was sent") }
+  if ((Get-StorePackageSha256 $PackagePath) -cne $ExpectedSha256) { throw (Hide-StoreSecret "not publishing: the package's SHA-256 is not the one checked before (the file changed since); nothing was sent") }
   $DeadlineUtc = $DeadlineUtc.ToUniversalTime()
   $reserve = $CommitTimeoutSeconds + $CommitReadBackBudgetSeconds
   $commitBy = $DeadlineUtc.AddSeconds(-$reserve)
