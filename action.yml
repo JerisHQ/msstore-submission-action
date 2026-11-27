@@ -1,9 +1,7 @@
 name: Microsoft Store submission (by submission id)
 description: >-
-  Publish an .msixupload to the Microsoft Store through the Store submission
-  API: create, upload, field compare, commit and read back, always by the id
-  of the submission this run created. Also inspect, read-only diagnose and
-  delete-draft modes.
+  Publish an .msixupload to the Microsoft Store by this run's submission id.
+  Also inspect, diagnose and delete-draft modes.
 author: JerisHQ
 branding:
   icon: upload-cloud
