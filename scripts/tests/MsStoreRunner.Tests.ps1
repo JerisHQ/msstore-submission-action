@@ -869,6 +869,9 @@ Describe 'Format-StoreMarkdownCode (package text in the job summary)' {
 Describe 'Package size limits (every read counted as it goes)' {
   BeforeAll {
     $script:SavedMax = & (Get-Module MsStoreRunner) { $script:MaxPackageBytes }
+    # .NET 11 checks a zip entry's length as it is read (see the stored-entry tests).
+    $script:NetChecksEntryLength = [Environment]::Version.Major -ge 11
+    $script:UnpackError = "the .msix inside the .msixupload is not a zip archive that can be read (the reader's message is not printed)"
     function script:Set-MaxPackageBytes([long]$Max) { & (Get-Module MsStoreRunner) { param($m) $script:MaxPackageBytes = $m } $Max }
     function script:Get-Package {
       Get-StorePackage -Dir $Dir -ExpectedName 'Contoso.ExampleApp' -ExpectedPublisher 'CN=00000000-0000-0000-0000-000000000000' -ExpectedVersion '0.4.1.0'
@@ -1006,14 +1009,18 @@ Describe 'Package size limits (every read counted as it goes)' {
     $r.Err | Should -BeNullOrEmpty
     $r.Value[-1].Version | Should -BeExactly '0.4.1.0'
   }
-  # .NET reads a stored zip entry to its stored length, whatever size its zip
-  # records give. Reading such an entry in full would allocate at least its
-  # stored length, here 16 MiB or more (Measure-Allocation).
+  # .NET 8 to 10 read a stored zip entry to its stored length, whatever size
+  # its zip records give. Reading such an entry in full would allocate at
+  # least its stored length, here 16 MiB or more (Measure-Allocation); the
+  # module's own count refuses it one byte past that size. .NET 11 checks the
+  # length itself (CrcValidatingReadStream) and throws before it returns a
+  # byte, which the module prints as the fixed unpack error (UnpackError).
   It 'refuses a stored AppxManifest.xml that holds more than its zip entry gives (here 16 MiB), one byte past that size' {
     $p = New-SizedPackage -ManifestSize 16MB -Stored manifest -ManifestSays 100
     $both = (Get-Item -LiteralPath $p).Length + (Get-MsixSize $p)
     $m = Measure-Allocation { Invoke-Captured { Get-Package } }
-    $m.Value.Err | Should -BeExactly 'the AppxManifest.xml in the .msix does not have the size its zip entry gives (reading stops at that size)'
+    $want = if ($NetChecksEntryLength) { $UnpackError } else { 'the AppxManifest.xml in the .msix does not have the size its zip entry gives (reading stops at that size)' }
+    $m.Value.Err | Should -BeExactly $want
     $m.Used | Should -BeLessThan ($both + 4MB) -Because "the .msixupload and the .msix come to $both bytes and the manifest is read to 101 bytes, not to its 16 MiB"
     @(Get-ChildItem -LiteralPath $Tmp).Count | Should -Be 0 -Because 'no copy is kept'
   }
@@ -1021,7 +1028,8 @@ Describe 'Package size limits (every read counted as it goes)' {
     $p = New-SizedPackage -Fill 32MB -Stored msix -MsixSays 1000
     $len = (Get-Item -LiteralPath $p).Length
     $m = Measure-Allocation { Invoke-Captured { Get-Package } }
-    $m.Value.Err | Should -BeExactly 'the .msix inside the .msixupload does not have the size its zip entry gives (reading stops at that size)'
+    $want = if ($NetChecksEntryLength) { $UnpackError } else { 'the .msix inside the .msixupload does not have the size its zip entry gives (reading stops at that size)' }
+    $m.Value.Err | Should -BeExactly $want
     $m.Used | Should -BeLessThan ($len + 4MB) -Because "the .msixupload is $len bytes and the .msix is read to 1001 bytes, not to its 32 MiB"
     @(Get-ChildItem -LiteralPath $Tmp).Count | Should -Be 0 -Because 'no copy is kept'
   }
