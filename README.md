@@ -29,11 +29,14 @@ with a Pester test suite and a fake Store API that runs on 127.0.0.1.
   with the **Manager** role (see Microsoft's
   [prerequisites for the submission API](https://learn.microsoft.com/en-us/windows/uwp/monetize/create-and-manage-submissions-using-windows-store-services)).
 - [ ] The app's first submission made by hand in Partner Center, with the age
-  ratings questionnaire answered. The API cannot create the first one (see
+  ratings questionnaire answered, and published. The API cannot create the
+  first one, and each submission it creates is a copy of the app's last
+  published submission, so there must be one (see
   [Microsoft Store API limits](#microsoft-store-api-limits)).
-- [ ] Recommended: that submission's publish mode is `Manual`
-  (`targetPublishMode=Manual`). Every new submission copies it, so a person
-  still decides in Partner Center when each one goes live (see
+- [ ] Recommended: the publish mode of the app's last published submission is
+  `Manual` (`targetPublishMode=Manual`). A new submission keeps the publish
+  mode of the most recent published submission, so a person still decides in
+  Partner Center when each one goes live (see
   [targetPublishMode=Manual](#targetpublishmodemanual)).
 - [ ] A GitHub environment (for example `store`) with required reviewers. The
   `publish` job runs in it, so nothing is sent to the Store until a reviewer
@@ -46,7 +49,8 @@ with a Pester test suite and a fake Store API that runs on 127.0.0.1.
 
 1. Go through [Before you start](#before-you-start).
 2. Have a build job in your workflow upload the `.msixupload` as an artifact
-   named `store-package`.
+   named `store-package`. The example assumes that job's ID is `build`; with
+   another ID, change `needs` of the `inspect` job to it.
 3. Copy the `inspect` and `publish` jobs from [Usage](#usage). Set
    `identity-name` and `publisher` to the `Identity` `Name` and `Publisher`
    in your package's AppxManifest, and replace `<full-commit-sha>` with the
@@ -72,7 +76,11 @@ every call after the create names this run's submission id.
 
 Two jobs: `inspect` shows what will be published without any secret, and
 `publish` runs in a protected environment whose required reviewers are the
-human gate. `publish` stops unless the package is the one `inspect` showed.
+human gate. When it is given the file name and SHA-256 that `inspect` showed
+(as in the example below), `publish` stops unless the package is that one.
+Both inputs are optional and checked only when passed: to make sure the
+package published is the one the reviewer saw before approving, pass
+`expected-sha256`.
 
 ```yaml
 name: Publish to the Microsoft Store
@@ -83,7 +91,8 @@ permissions:
   contents: read
 
 jobs:
-  # build: a job that uploads the .msixupload as the artifact "store-package"
+  # build: a job that uploads the .msixupload as the artifact "store-package".
+  # Its ID must be the one in inspect's "needs" (here: build).
 
   inspect:
     needs: build
@@ -130,9 +139,10 @@ jobs:
       - run: echo "committed submission ${{ steps.publish.outputs.submission-id }}"
 ```
 
-Pin the action to a full commit SHA. Once a `v1` release is out you can use
-`@v1` instead, but pinning a full commit SHA is still recommended. It runs on
-`windows-latest` and `ubuntu-latest` (PowerShell 7 is on both; CI tests both).
+Pin the action to a full commit SHA. `@v1` works only once this repository
+has a `v1` tag; publishing a `v1.0.0` release does not create one. Even then,
+pinning a full commit SHA is recommended. It runs on `windows-latest` and
+`ubuntu-latest` (PowerShell 7 is on both; CI tests both).
 
 ### Inputs
 
@@ -144,8 +154,8 @@ Pin the action to a full commit SHA. Once a `v1` release is out you can use
 | `identity-name` | inspect, publish | | expected AppxManifest `Identity Name` |
 | `publisher` | inspect, publish | | expected AppxManifest `Identity Publisher` (`CN=...`) |
 | `version` | inspect, publish | | optional expected version; it must end in `.0` either way |
-| `expected-file-name` | publish | | file name an earlier `inspect` showed; the run stops on any other |
-| `expected-sha256` | publish | | SHA-256 an earlier `inspect` showed; the run stops on any other |
+| `expected-file-name` | publish | | optional: file name an earlier `inspect` showed; when given, the run stops on any other |
+| `expected-sha256` | publish | | optional: SHA-256 an earlier `inspect` showed; when given, the run stops on any other. Pass it to check the package's content against what the reviewer saw before approving |
 | `submission-id` | diagnose, delete-draft | | the submission id, digits only; checked before the sign-in |
 | `tenant-id` | publish, diagnose, delete-draft | | Entra tenant id (pass a secret) |
 | `client-id` | publish, diagnose, delete-draft | | client id of the app registration (pass a secret) |
@@ -295,7 +305,8 @@ What the action works around, and what it cannot do:
 - **The first submission is made in Partner Center.** Microsoft requires at
   least one submission of the app made in Partner Center, with the age ratings
   questionnaire answered, before the API can create one. A new submission is a
-  copy of the last published submission.
+  copy of the last published submission, so that first submission must also
+  have been published.
 - **Commit is asynchronous.** The commit request only starts processing
   (`CommitStarted`, then `PreProcessing` and certification); the read-back
   waits for a committed status that holds the new package version. An
