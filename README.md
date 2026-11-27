@@ -72,12 +72,14 @@ A zip whose central directory is not found that way, or whose records are
 not as many as its end records give, is refused as a zip that cannot be
 read. So is one where some .NET version from 8 to 11 could find another
 central directory: the end record is the last one in the zip's last 65,557
-bytes, and its comment must end within the zip; a zip64 locator must start
-exactly 20 bytes before the end record, with no other locator signature 20
-to 48 bytes before it (.NET 8 and 9 take one anywhere there, .NET 10 and 11
-only 20 bytes before); each end record field must be 0xFFFF / 0xFFFFFFFF or
-the same as in the zip64 end record; and no central directory record may
-run past the end of the zip (.NET 8 and 9 list it, .NET 10 and 11 do not).
+bytes, and its comment must end within the zip; a zip64 locator that starts
+20 bytes before the end record is the one every version takes, whatever
+bytes come before it, but with none there, a locator signature 21 to 48
+bytes before it is refused (.NET 8 and 9 take the last one there, .NET 10
+and 11 look only 20 bytes before); each end record field must be 0xFFFF /
+0xFFFFFFFF or the same as in the zip64 end record; and no central directory
+record may run past the end of the zip (.NET 8 and 9 list it, .NET 10 and
+11 do not).
 Listing a zip's entries keeps an object for each, with its name and
 comment: measured on Linux with 65,535 entries and 16 MiB of names, .NET
 kept about 67 MB (PowerShell 7.7.0, .NET 11) and 61 MB (PowerShell 7.6.10,

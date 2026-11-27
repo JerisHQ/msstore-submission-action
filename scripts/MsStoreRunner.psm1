@@ -344,10 +344,14 @@ function Assert-StoreZipDirectory([Parameter(Mandatory)][IO.Stream]$Zip, [Parame
 # When the end record's disk number or entry count is 0xFFFF or its directory
 # offset is 0xFFFFFFFF, ZipArchive looks for a zip64 locator ("PK 6 7"):
 # .NET 10 and 11 only where it ends, 20 bytes before the end record; .NET 8
-# and 9 at any signature starting 20 to 48 bytes before it, the last one. So
-# a locator signature there must start 20 bytes before the end record, with
-# no other there, or the zip gives $null; with none, every version keeps the
-# end record's own fields. The zip64 end record ("PK 6 6") the locator points
+# and 9 search the 32 bytes that end 16 bytes before it from their last byte
+# back, and take the first signature found, the one that starts last, 20 to
+# 48 bytes before it. So every version takes a locator that starts 20 bytes
+# before the end record, whatever bytes come before it (the zip64 end record
+# can hold "PK 6 7" in its directory offset or size). With none there, a
+# signature that starts 21 to 48 bytes before gives $null (.NET 8 and 9 take
+# it, .NET 10 and 11 do not); with none at all, every version keeps the end
+# record's own fields. The zip64 end record ("PK 6 6") the locator points
 # to then gives the count, size and offset instead, and each field of the end
 # record must be 0xFFFF / 0xFFFFFFFF or the same as in the zip64 end record,
 # as a zip64 writer leaves them, or the zip gives $null.
@@ -387,11 +391,8 @@ function Measure-StoreZipDirectory([Parameter(Mandatory)][IO.Stream]$Zip) {
     if ($endAt -lt 20) { return $null }
     $winAt = [Math]::Max(0, $endAt - 48)
     $win = Read-StoreZipBytes $Zip $winAt ([int]($endAt - $winAt))
-    # Only signatures that start at least 20 bytes before the end record; the
-    # first one found must be the one that starts exactly 20 bytes before it.
-    $loc = [Text.Encoding]::Latin1.GetString($win, 0, $win.Length - 16).IndexOf("PK$([char]6)$([char]7)", [StringComparison]::Ordinal)
-    if ($loc -ge 0) {
-      if ($loc -ne $win.Length - 20) { return $null }
+    $loc = $win.Length - 20
+    if ($win[$loc] -eq 0x50 -and $win[$loc + 1] -eq 0x4B -and $win[$loc + 2] -eq 6 -and $win[$loc + 3] -eq 7) {
       $recAt = [BitConverter]::ToUInt64($win, $loc + 8)
       if ($len -lt 56 -or $recAt -gt [uint64]($len - 56)) { return $null }
       $rec = Read-StoreZipBytes $Zip ([long]$recAt) 56
@@ -406,6 +407,8 @@ function Measure-StoreZipDirectory([Parameter(Mandatory)][IO.Stream]$Zip) {
       }
       $listed = $z64[3]; $declared = $z64[4]; $start = $z64[5]
     }
+    # None 20 bytes before: only signatures that start 21 to 48 bytes before.
+    elseif ([Text.Encoding]::Latin1.GetString($win, 0, $win.Length - 17).Contains("PK$([char]6)$([char]7)", [StringComparison]::Ordinal)) { return $null }
   }
   if ($start -gt [uint64]$len) { return $null }
   $avail = $len - [long]$start
