@@ -191,6 +191,34 @@ Describe 'action.yml package step' {
       EXPECTED_VERSION = ''; EXPECTED_FILE = ''; EXPECTED_SHA256 = ''; RUNNER_TEMP = $Tmp }
   }
   AfterEach { Remove-Item -LiteralPath $Dir, $Tmp -Recurse -Force -ErrorAction SilentlyContinue }
+  # A zip of the given entries (name -> bytes), for packages
+  # New-TestMsixUpload does not make.
+  function script:New-TestZip([System.Collections.IDictionary]$Entries) {
+    $ms = [IO.MemoryStream]::new()
+    $z = [IO.Compression.ZipArchive]::new($ms, [IO.Compression.ZipArchiveMode]::Create, $true)
+    try {
+      foreach ($k in $Entries.Keys) {
+        $s = $z.CreateEntry($k).Open()
+        try { $b = [byte[]]$Entries[$k]; $s.Write($b, 0, $b.Length) } finally { $s.Dispose() }
+      }
+    } finally { $z.Dispose() }
+    , $ms.ToArray()
+  }
+  # The text a CommonMark code span that makes up the whole of Line shows:
+  # an opening run of n backticks, closed by the first run of exactly n,
+  # with one space taken off each end when both ends have one (and it is not
+  # all spaces). $null when Line is not one code span.
+  function script:Read-CodeSpan([string]$Line) {
+    $open = [regex]::Match($Line, '\A`+')
+    if (-not $open.Success) { return $null }
+    $n = $open.Length
+    $rest = $Line.Substring($n)
+    $close = [regex]::Match($rest, '(?<!`)`{' + $n + '}(?!`)')
+    if (-not $close.Success -or $close.Index + $n -ne $rest.Length) { return $null }
+    $t = $rest.Substring(0, $close.Index)
+    if ($t.Length -ge 2 -and $t[0] -eq ' ' -and $t[-1] -eq ' ' -and $t.Trim(' ')) { $t = $t.Substring(1, $t.Length - 2) }
+    $t
+  }
 
   # A step's output is a line in a file that every later step reads; package
   # text in a log line could be a workflow command ("::cmd::" at the start of a
@@ -328,5 +356,59 @@ Describe 'action.yml package step' {
   It 'stops when the folder holds <Count> .msixupload files' -ForEach @(@{ Count = 0 }, @{ Count = 2 }) {
     if ($Count -eq 0) { Remove-Item -LiteralPath $PkgPath } else { $null = & $MakePackage -Dir $Dir -Version '1.2.4.0' }
     (Invoke-Step 'package' $Base).Err | Should -Match "^expected exactly one \.msixupload in .*, found $Count$"
+  }
+  # Unpacking and XML errors can quote the package (a PowerShell [xml] cast
+  # error quotes the whole manifest): a reader's or parser's message is never
+  # printed, only fixed text. Each package holds a harmless marker where such
+  # a message would quote it.
+  It 'prints fixed text only, never the package text, when <Case>' -ForEach @(
+    @{ Case = 'the .msixupload is not a zip'; Kind = 'Outer'; Xml = $false; Text = 'Zq7HarmlessMarker: not a zip'
+       Err = "the .msixupload is not a zip archive that can be read (the reader's message is not printed)" }
+    @{ Case = 'the .msix is not a zip'; Kind = 'Msix'; Xml = $false; Text = 'Zq7HarmlessMarker: not a zip'
+       Err = "the .msix inside the .msixupload is not a zip archive that can be read (the reader's message is not printed)" }
+    @{ Case = 'the manifest end tag does not match'; Kind = 'Manifest'; Xml = $true
+       Text = '<?xml version="1.0" encoding="utf-8"?><Package><Identity Name="Contoso.ExampleApp" /></Zq7HarmlessMarker>'
+       Err = "the AppxManifest.xml in the .msix is not XML that can be read (the parser's message is not printed)" }
+    @{ Case = 'the manifest names an undeclared entity'; Kind = 'Manifest'; Xml = $true
+       Text = '<?xml version="1.0" encoding="utf-8"?><Package><Identity Name="&Zq7HarmlessMarker;" /></Package>'
+       Err = "the AppxManifest.xml in the .msix is not XML that can be read (the parser's message is not printed)" }
+    # A PowerShell [xml] cast reads this one; the action's parser refuses any
+    # DTD, which would otherwise put the entity's text in the Identity Name.
+    @{ Case = 'the manifest has a DTD'; Kind = 'Manifest'; Xml = $false
+       Text = '<?xml version="1.0"?><!DOCTYPE Package [<!ENTITY m "Zq7HarmlessMarker">]><Package><Identity Name="&m;" /></Package>'
+       Err = "the AppxManifest.xml in the .msix is not XML that can be read (the parser's message is not printed)" }
+    @{ Case = 'the .msix has no AppxManifest.xml'; Kind = 'Other'; Xml = $false; Text = '<Zq7HarmlessMarker/>'
+       Err = 'expected one AppxManifest.xml at the root of the .msix, found 0' }
+  ) {
+    $b = [Text.Encoding]::UTF8.GetBytes($Text)
+    if ($Xml) { { [xml]$Text } | Should -Throw -ExpectedMessage '*Zq7HarmlessMarker*' -Because 'a PowerShell [xml] cast error quotes the manifest' }
+    if ($Kind -cne 'Outer') {
+      $inner = if ($Kind -ceq 'Msix') { $b } else { New-TestZip ([ordered]@{ $(if ($Kind -ceq 'Manifest') { 'AppxManifest.xml' } else { 'Other.xml' }) = $b }) }
+      $b = New-TestZip ([ordered]@{ 'ExampleApp.msix' = $inner })
+    }
+    [IO.File]::WriteAllBytes($PkgPath, [byte[]]$b)
+    $r = Invoke-Step 'package' $Base
+    $r.Err | Should -BeExactly $Err
+    $r.Out + $r.Err | Should -Not -Match 'Zq7HarmlessMarker'
+    $r.Output | Should -BeNullOrEmpty
+    $r.Summary | Should -BeNullOrEmpty
+    @(Get-ChildItem -LiteralPath $Tmp).Count | Should -Be 0 -Because 'a refused package leaves no copy'
+    Assert-NoWorkflowCommand $r
+  }
+  # The job summary shows the file name in a Markdown code span; no backtick
+  # in the name may end it.
+  It 'shows a file name with <Case> whole in the job summary' -ForEach @(
+    @{ Case = 'backticks'; Name = 'Ex`ample``App-1.2.3.0-x64.msixupload' }
+    @{ Case = 'a backtick first'; Name = '`ExampleApp-1.2.3.0-x64.msixupload' }
+    @{ Case = 'a space and a backtick'; Name = 'Example App` 1.2.3.0-x64.msixupload' }
+  ) {
+    [IO.File]::Move($PkgPath, [IO.Path]::Combine($Dir, $Name))
+    $r = Invoke-Step 'package' $Base
+    $r.Err | Should -BeNullOrEmpty
+    $r.Output[1] | Should -BeExactly "file_name=$Name"
+    $line = @($r.Summary -split '\r?\n' | Where-Object { $_.StartsWith('- File: ') })
+    $line.Count | Should -Be 1
+    Read-CodeSpan $line[0].Substring(8) | Should -BeExactly $Name
+    @($r.Summary -split '\r?\n' | Where-Object { $_.StartsWith('- SHA-256: ') }) | Should -BeExactly "- SHA-256: ``$Sha``"
   }
 }

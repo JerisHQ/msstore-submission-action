@@ -68,7 +68,7 @@ BeforeAll {
       $line = "$Method $(if ($Kind -eq 'Upload') { '(upload)' } else { ([uri]$Uri).AbsolutePath }) timeout=$wait"
       [void]$global:FakeStore.Calls.Add($line)
       if ($global:FakeTrace) { Write-Host "[http] $line" }
-      $bytes = if ($InFile) { [IO.File]::ReadAllBytes($InFile) } elseif ($Body) { [Text.Encoding]::UTF8.GetBytes($Body) } else { [byte[]]@() }
+      $bytes = if ($null -ne $BodyBytes) { $BodyBytes } elseif ($Body) { [Text.Encoding]::UTF8.GetBytes($Body) } else { [byte[]]@() }
       $r = Invoke-FakeStoreRequest -Store $global:FakeStore -Method $Method -Uri $Uri -Headers $h -BodyBytes $bytes
       $took = if ($r.StatusCode -eq -1) { [int]::MaxValue } elseif ($Kind -eq 'Upload') { $global:FakeStore.UploadSeconds } else { $global:FakeStore.CallSeconds }
       if ($took -gt $wait) {
@@ -115,6 +115,63 @@ BeforeAll {
     $p = Join-Path $dir $File
     [IO.File]::WriteAllBytes($p, [byte[]](0..255 + 0..255))
     $p
+  }
+
+  # A package file that changes on disk while it is read: what the module's
+  # Open-StorePackageRead hands back in some tests. It reads the file with no
+  # buffer and, once (AtEnd: when a read first finds the end of the file;
+  # else: right after the first block read), writes Other over the file
+  # through a second handle: from the read position on, or (AtEnd) as the
+  # whole file. Reads counts the reads, Rewinds every seek or Position set.
+  if (-not ('MsStoreTests.ChangingReadStream' -as [type])) {
+    Add-Type -TypeDefinition @'
+namespace MsStoreTests {
+  public sealed class ChangingReadStream : System.IO.Stream {
+    private readonly System.IO.FileStream _f;
+    private readonly string _path;
+    private readonly byte[] _other;
+    private readonly bool _atEnd;
+    public int Reads;
+    public int Rewinds;
+    public bool Changed;
+    public ChangingReadStream(string path, byte[] other, bool atEnd) {
+      _path = path; _other = other; _atEnd = atEnd;
+      _f = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete, 1);
+    }
+    public override int Read(byte[] buffer, int offset, int count) {
+      int n = _f.Read(buffer, offset, count);
+      Reads++;
+      if (!Changed && (_atEnd ? n == 0 : n > 0)) { Changed = true; Change(); }
+      return n;
+    }
+    private void Change() {
+      using (var w = new System.IO.FileStream(_path, System.IO.FileMode.Open, System.IO.FileAccess.Write, System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete)) {
+        if (_atEnd) { w.SetLength(0); w.Write(_other, 0, _other.Length); }
+        else { w.Position = _f.Position; w.Write(_other, 0, (int)System.Math.Min(_other.Length, w.Length - _f.Position)); }
+      }
+    }
+    public override bool CanRead { get { return true; } }
+    public override bool CanSeek { get { return true; } }
+    public override bool CanWrite { get { return false; } }
+    public override long Length { get { return _f.Length; } }
+    public override long Position { get { return _f.Position; } set { Rewinds++; _f.Position = value; } }
+    public override long Seek(long offset, System.IO.SeekOrigin origin) { Rewinds++; return _f.Seek(offset, origin); }
+    public override void Flush() { }
+    public override void SetLength(long value) { throw new System.NotSupportedException(); }
+    public override void Write(byte[] buffer, int offset, int count) { throw new System.NotSupportedException(); }
+    protected override void Dispose(bool disposing) { if (disposing) { _f.Dispose(); } base.Dispose(disposing); }
+  }
+}
+'@
+  }
+  # Makes Open-StorePackageRead hand back a ChangingReadStream ($global:Reading)
+  # that writes $Other over the file it reads (see above).
+  function script:Use-ChangingPackageRead([byte[]]$Other, [switch]$AtEnd) {
+    $global:ChangeTo = $Other; $global:ChangeAtEnd = [bool]$AtEnd; $global:Reading = $null
+    Mock -ModuleName MsStoreRunner Open-StorePackageRead {
+      $global:Reading = [MsStoreTests.ChangingReadStream]::new($Path, $global:ChangeTo, $global:ChangeAtEnd)
+      $global:Reading
+    }
   }
 
   # Prices: the fake's priceId, trialPeriod, market and sale prices, and the
@@ -772,6 +829,25 @@ Describe 'Write-StoreStepOutput (step outputs checked before anything is written
   }
 }
 
+Describe 'Format-StoreMarkdownCode (package text in the job summary)' {
+  It 'gives <Want> for <Case>' -ForEach @(
+    @{ Case = 'plain text'; Text = '1.2.3.0'; Want = '`1.2.3.0`' }
+    @{ Case = 'a backtick'; Text = 'a`b.msixupload'; Want = '``a`b.msixupload``' }
+    @{ Case = 'runs of one and two backticks'; Text = 'a`b``c.msixupload'; Want = '```a`b``c.msixupload```' }
+    @{ Case = 'a run of three backticks'; Text = 'a```b.msixupload'; Want = '````a```b.msixupload````' }
+    @{ Case = 'a backtick first'; Text = '`a.msixupload'; Want = '`` `a.msixupload ``' }
+    @{ Case = 'a backtick last'; Text = 'a.msixupload`'; Want = '`` a.msixupload` ``' }
+    @{ Case = 'a space first'; Text = ' a.msixupload'; Want = '`  a.msixupload `' }
+  ) {
+    Format-StoreMarkdownCode $Text | Should -BeExactly $Want
+  }
+  It 'refuses text with <Case>' -ForEach @(
+    @{ Case = 'a line feed'; Text = "a`nb" }, @{ Case = 'a carriage return'; Text = "a`rb" }, @{ Case = 'U+2028'; Text = "a$([char]0x2028)b" }
+  ) {
+    { Format-StoreMarkdownCode $Text } | Should -Throw -ExpectedMessage 'refused: text for the job summary holds a line break or another control character'
+  }
+}
+
 Describe 'Publish-StoreSubmission (fake Store)' {
   BeforeEach { $script:Pkg = New-TestPackage }
   AfterEach { Remove-Item -LiteralPath (Split-Path $Pkg) -Recurse -Force }
@@ -817,6 +893,67 @@ Describe 'Publish-StoreSubmission (fake Store)' {
     $r.Err | Should -BeExactly $Err
     @($s.Log).Count | Should -Be 0
     @(Get-FakeUploadedZip $s).Count | Should -Be 0
+  }
+  # The upload reads the package once: each block read goes into the zip
+  # entry and into the SHA-256 together, and the zip is sent only when that
+  # hash is the checked one. Here the file changes on disk after the first
+  # block of that one read.
+  It 'Send-StorePackage uploads nothing when the package changes while it is read' {
+    $data = [byte[]]::new(1MB); [Random]::new(7).NextBytes($data)
+    [IO.File]::WriteAllBytes($Pkg, $data)
+    $sha = Get-TestSha $Pkg
+    Use-ChangingPackageRead ([Text.Encoding]::ASCII.GetBytes('Z' * 1MB))
+    $s = New-FakeStore; Use-FakeStore $s
+    $r = Invoke-Captured { Send-StorePackage -UploadUrl 'https://fakeupload.blob.core.windows.net/blob/upload.zip?sv=1&sig=FAKE%2BSAS' -PackagePath $Pkg -ExpectedSha256 $sha }
+    $r.Err | Should -BeExactly "package upload refused: the package's SHA-256 is not the one checked before (the file changed since); nothing was sent"
+    Should -Invoke -ModuleName MsStoreRunner Open-StorePackageRead -Times 1 -Exactly
+    $global:Reading.Changed | Should -BeTrue
+    $global:Reading.Reads | Should -BeGreaterThan 2 -Because 'the file changed after the first block and the read went on'
+    $global:Reading.Rewinds | Should -Be 0 -Because 'the package is read once, never again from the start'
+    Get-TestSha $Pkg | Should -Not -Be $sha -Because 'the file on disk did change'
+    @($s.Calls).Count | Should -Be 0 -Because 'no request was sent'
+    @(Get-FakeUploadedZip $s).Count | Should -Be 0
+  }
+  # A file that changes after that one read (here: once the read reached its
+  # end) is never read again: what is sent is what was hashed.
+  It 'Send-StorePackage sends the bytes it hashed when the package changes after its one read' {
+    $data = [byte[]]::new(1MB); [Random]::new(8).NextBytes($data)
+    [IO.File]::WriteAllBytes($Pkg, $data)
+    $sha = Get-TestSha $Pkg
+    Use-ChangingPackageRead ([Text.Encoding]::ASCII.GetBytes('Z' * 1MB)) -AtEnd
+    $s = New-FakeStore; Use-FakeStore $s
+    $r = Invoke-Captured { Send-StorePackage -UploadUrl 'https://fakeupload.blob.core.windows.net/blob/upload.zip?sv=1&sig=FAKE%2BSAS' -PackagePath $Pkg -ExpectedSha256 $sha }
+    $r.Err | Should -BeNullOrEmpty
+    $global:Reading.Changed | Should -BeTrue
+    $global:Reading.Rewinds | Should -Be 0 -Because 'the package is read once, never again from the start'
+    Get-TestSha $Pkg | Should -Not -Be $sha -Because 'the file on disk did change'
+    $sent = @(Get-FakeUploadedZip $s)
+    $sent.Count | Should -Be 1
+    [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([byte[]]$sent[0].Bytes)).ToLowerInvariant() | Should -BeExactly $sha
+  }
+  # Get-StorePackage reads the package once, too: the SHA-256 it returns, the
+  # copy and the manifest it checked are all of those bytes.
+  It 'Get-StorePackage reads the package once: its SHA-256, the copy and the checked manifest are of the same bytes' {
+    $dir = Join-Path ([IO.Path]::GetTempPath()) ('pkgdir-' + [guid]::NewGuid().ToString('N'))
+    $dir2 = Join-Path ([IO.Path]::GetTempPath()) ('pkgdir-' + [guid]::NewGuid().ToString('N'))
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ('runner-temp-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory $tmp | Out-Null
+    $saved = $env:RUNNER_TEMP
+    try {
+      $env:RUNNER_TEMP = $tmp
+      $orig = & (Join-Path $PSScriptRoot 'New-TestMsixUpload.ps1') -Dir $dir -Version '0.4.1.0' -FileName $File
+      $want = Get-TestSha $orig
+      # Another package, another identity: what the file becomes once read.
+      $other = & (Join-Path $PSScriptRoot 'New-TestMsixUpload.ps1') -Dir $dir2 -Name 'Contoso.OtherApp' -Version '0.4.1.0' -FileName $File
+      Use-ChangingPackageRead ([IO.File]::ReadAllBytes($other)) -AtEnd
+      $p = Get-StorePackage -Dir $dir -ExpectedName 'Contoso.ExampleApp' -ExpectedPublisher 'CN=00000000-0000-0000-0000-000000000000' -ExpectedVersion '0.4.1.0' 6>$null
+      Should -Invoke -ModuleName MsStoreRunner Open-StorePackageRead -Times 1 -Exactly
+      $global:Reading.Changed | Should -BeTrue
+      $global:Reading.Rewinds | Should -Be 0
+      Get-TestSha $orig | Should -BeExactly (Get-TestSha $other) -Because 'the file on disk did change'
+      $p.Sha256 | Should -BeExactly $want
+      Get-TestSha $p.Path | Should -BeExactly $want
+    } finally { $env:RUNNER_TEMP = $saved; Remove-Item -LiteralPath $dir, $dir2, $tmp -Recurse -Force -ErrorAction SilentlyContinue }
   }
   It '<Fn> sends nothing for a package file name with <Case>' -ForEach @(
     @{ Fn = 'Publish-StoreSubmission'; Case = '##['; Name = '##[set-output name=submission_id]ExampleApp-0.4.1.0-x64.msixupload' }
@@ -5776,13 +5913,13 @@ Describe 'A change is sent at most once: the server read it whole, then closed t
     @{ Name = 'a DELETE'; Drop = 'Delete'; Method = 'DELETE'; Path = "submissions/1234567895000000099"; Kind = 'Api'; Body = $null; Length = '0' }
     @{ Name = 'the PUT of a submission (a body)'; Drop = 'Update'; Method = 'PUT'; Path = "submissions/1234567895000000099"; Kind = 'Api'; Body = '{}'; Length = '2' }
     @{ Name = 'the token request (a form body)'; Drop = 'Token'; Method = 'POST'; Path = '/tenant-1/oauth2/v2.0/token'; Kind = 'Token'; Body = 'grant_type=client_credentials'; Length = '29' }
-    @{ Name = 'the package upload (a file)'; Drop = 'Upload'; Method = 'PUT'; Path = '/blob/upload.zip'; Kind = 'Upload'; Body = $null; Length = '512' }
+    @{ Name = 'the package upload (the zip bytes)'; Drop = 'Upload'; Method = 'PUT'; Path = '/blob/upload.zip'; Kind = 'Upload'; Body = $null; Length = '512' }
   ) {
     $Srv.DropOn = $Drop; $Srv.DropTimes = 100; $Srv.DropNotDone = $true
     InModuleScope MsStoreRunner { $script:LoopbackTestServer = $true }
     $a = @{ Method = $Method; Uri = $(if ($Kind -eq 'Api') { "$Url$Base/$Path" } else { "$Url$Path" }); Kind = $Kind; TimeoutSec = 30 }
     if ($Kind -eq 'Api') { $a.Headers = @{ Authorization = "Bearer $($Srv.Token)" } }
-    if ($Kind -eq 'Upload') { $a.InFile = $Pkg; $a.Headers = @{ 'x-ms-blob-type' = 'BlockBlob' } }
+    if ($Kind -eq 'Upload') { $a.BodyBytes = [IO.File]::ReadAllBytes($Pkg); $a.Headers = @{ 'x-ms-blob-type' = 'BlockBlob' } }
     if ($null -ne $Body) { $a.Body = $Body; $a.ContentType = $(if ($Kind -eq 'Token') { 'application/x-www-form-urlencoded' } else { 'application/json' }) }
     $err = $null
     try { & (Get-Module MsStoreRunner) { param($a) Invoke-StoreHttp @a } $a | Out-Null } catch { $err = $_ }

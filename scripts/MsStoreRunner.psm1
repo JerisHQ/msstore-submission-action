@@ -113,23 +113,32 @@ $script:ReadOnlyCalls = $false
 $script:DeleteOnlyPath = ''
 $script:DeleteOnlySent = $false
 
+# The most bytes Get-StorePackage and Send-StorePackage read: each holds the
+# package (and Send-StorePackage its zip) in memory, and a .NET array or
+# memory stream holds less than 2 GiB.
+$script:MaxPackageBytes = 2000000000
+
 # Finds the one Store package in $Dir, copies it and checks its identity and
 # version. Returns Path (the copy, which is what gets uploaded), FileName,
 # Version (the manifest Identity Version) and Sha256 (of the copy).
 #
-# The copy: the package is read from $Dir once, into a new folder under the
-# runner's temp folder (RUNNER_TEMP, else the system temp folder), and made
-# read-only. The manifest check and the SHA-256 read that copy, and the
-# publish step uploads it (Send-StorePackage checks the SHA-256 again on the
-# handle it zips from), so a file replaced in $Dir after the check is never
-# what gets uploaded.
+# The package is read from $Dir once, into memory (Open-StorePackageRead), at
+# most MaxPackageBytes. The SHA-256, the copy and the manifest check all use
+# those bytes; no file is read a second time. The copy is written to a new
+# folder under the runner's temp folder (RUNNER_TEMP, else the system temp
+# folder) and made read-only, and the publish step uploads it
+# (Send-StorePackage hashes the bytes it zips in the same pass and sends
+# nothing unless they are these), so a file replaced in $Dir after the check
+# is never what gets uploaded.
 #
 # Package text (the folder, file names, manifest fields) can hold anything.
 # A manifest field with a line break or another control character stops the
 # run (Test-StorePlainText), and so does a file name with one or with workflow
 # command text (Test-StorePackageFileName); package text is printed and
 # thrown only through Protect-WorkflowCommand, so it cannot run a workflow
-# command.
+# command. A package that cannot be unpacked or a manifest that is not XML
+# stops the run with fixed text (Read-StorePackageManifest): the reader's
+# message can quote the package.
 function Get-StorePackage {
   param(
     [Parameter(Mandatory)][string]$Dir,
@@ -146,30 +155,27 @@ function Get-StorePackage {
   # Only the exact lower-case extension is accepted, as the Store CLI did.
   if ($upload.Extension -cne '.msixupload') { throw (Hide-StoreSecret (Protect-WorkflowCommand "extension '$($upload.Extension)' is not exactly .msixupload")) }
   if ($upload.Length -le 0) { throw (Hide-StoreSecret (Protect-WorkflowCommand "$($upload.Name) is empty")) }
+  if ($upload.Length -gt $script:MaxPackageBytes) { throw (Hide-StoreSecret "the .msixupload is larger than $($script:MaxPackageBytes) bytes, the most this action reads") }
 
   $root = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
   $keep = Join-Path $root ("msstore-package-" + [guid]::NewGuid().ToString('N'))
   $copy = Join-Path $keep $upload.Name
-  $work = Join-Path ([IO.Path]::GetTempPath()) ("msix-inspect-" + [guid]::NewGuid().ToString('N'))
   $kept = $false
   New-Item -ItemType Directory $keep | Out-Null
   try {
-    New-Item -ItemType Directory $work | Out-Null
-    Copy-Item -LiteralPath $upload.FullName $copy
+    # The one read of the package.
+    $bytes = [IO.MemoryStream]::new()
+    $src = Open-StorePackageRead $upload.FullName
+    try { $src.CopyTo($bytes) } finally { $src.Dispose() }
+    if ($bytes.Length -le 0 -or $bytes.Length -gt $script:MaxPackageBytes) { throw (Hide-StoreSecret "the .msixupload changed size while it was read") }
+    $bytes.Position = 0
+    $sha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+    $out = [IO.File]::Open($copy, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $bytes.WriteTo($out) } finally { $out.Dispose() }
     (Get-Item -LiteralPath $copy).IsReadOnly = $true
-    $sha = Get-StoreFileSha256 $copy
-    # Expand-Archive wants a .zip name; the bytes it reads are checked to be
-    # the copy's.
-    Copy-Item -LiteralPath $copy (Join-Path $work 'upload.zip')
-    if ((Get-StoreFileSha256 (Join-Path $work 'upload.zip')) -cne $sha) { throw (Hide-StoreSecret "the package copy changed while it was read") }
-    Expand-Archive (Join-Path $work 'upload.zip') (Join-Path $work 'upload')
-    $msix = @(Get-ChildItem (Join-Path $work 'upload') -Filter *.msix)
-    if ($msix.Count -ne 1) { throw (Hide-StoreSecret "expected one .msix inside the .msixupload, found $($msix.Count)") }
-    Write-StoreHost (Protect-WorkflowCommand "Package: $($upload.FullName) contains $($msix[0].Name) ($($msix[0].Length) bytes)")
-    Copy-Item -LiteralPath $msix[0].FullName (Join-Path $work 'pkg.zip')
-    Expand-Archive (Join-Path $work 'pkg.zip') (Join-Path $work 'pkg')
-    [xml]$m = Get-Content -LiteralPath (Join-Path $work 'pkg' 'AppxManifest.xml')
-    $id = $m.Package.Identity
+    $found = Read-StorePackageManifest $bytes
+    Write-StoreHost (Protect-WorkflowCommand "Package: $($upload.FullName) contains $($found.MsixName) ($($found.MsixLength) bytes)")
+    $id = $found.Manifest.Package.Identity
     $name = [string]$id.Name; $publisher = [string]$id.Publisher; $version = [string]$id.Version
     foreach ($f in @(@('Name', $name), @('Publisher', $publisher), @('Version', $version))) {
       if (-not (Test-StorePlainText $f[1])) { throw (Hide-StoreSecret "the manifest Identity $($f[0]) holds a line break or another control character") }
@@ -181,11 +187,65 @@ function Get-StorePackage {
     if ($ExpectedVersion -and $version -cne $ExpectedVersion) { throw (Hide-StoreSecret (Protect-WorkflowCommand "package version $version does not match the expected version ($ExpectedVersion)")) }
     $kept = $true
   } finally {
-    Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
     if (-not $kept) { Remove-Item -LiteralPath $keep -Recurse -Force -ErrorAction SilentlyContinue }
   }
   Write-StoreHost (Protect-WorkflowCommand "$sha  $($upload.Name)")
   [pscustomobject]@{ Path = $copy; FileName = $upload.Name; Version = $version; Sha256 = $sha }
+}
+
+# Opens a package file for its one read (Get-StorePackage, Send-StorePackage).
+# Other processes may still read it; on Windows none may write it while it is
+# open (on Linux that share mode is only advisory, so the callers check what
+# they read, never the file again). A function of its own so a test can hand
+# the callers a file that changes while they read it.
+function Open-StorePackageRead([Parameter(Mandatory)][string]$Path) {
+  [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+}
+
+# Reads the manifest of a .msixupload held in memory (Package, as
+# Get-StorePackage read it): the one .msix at the zip root, then the
+# AppxManifest.xml at its root, parsed with no DTD and no external resource.
+# Nothing is written to disk. Returns MsixName, MsixLength and Manifest (the
+# XmlDocument). A zip or .msix that cannot be unpacked, or a manifest that is
+# not XML, is thrown as fixed text: the reader's and the parser's messages can
+# quote the package (an XML error quotes the manifest text it stopped at).
+function Read-StorePackageManifest([Parameter(Mandatory)][IO.MemoryStream]$Package) {
+  $outer = $null; $inner = $null; $msixBytes = $null
+  try {
+    try {
+      $Package.Position = 0
+      $outer = [IO.Compression.ZipArchive]::new($Package, [IO.Compression.ZipArchiveMode]::Read, $true)
+      $msix = @($outer.Entries | Where-Object { $_.FullName -cnotmatch '[/\\]' -and $_.FullName -like '*.msix' })
+    } catch { throw (Hide-StoreSecret "the .msixupload is not a zip archive that can be read (the reader's message is not printed)") }
+    if ($msix.Count -ne 1) { throw (Hide-StoreSecret "expected one .msix inside the .msixupload, found $($msix.Count)") }
+    if ($msix[0].Length -gt $script:MaxPackageBytes) { throw (Hide-StoreSecret "the .msix inside the .msixupload is larger than $($script:MaxPackageBytes) bytes, the most this action reads") }
+    try {
+      $msixBytes = [IO.MemoryStream]::new()
+      $s = $msix[0].Open()
+      try { $s.CopyTo($msixBytes) } finally { $s.Dispose() }
+      $msixBytes.Position = 0
+      $inner = [IO.Compression.ZipArchive]::new($msixBytes, [IO.Compression.ZipArchiveMode]::Read, $true)
+      $man = @($inner.Entries | Where-Object { $_.FullName -ceq 'AppxManifest.xml' })
+    } catch { throw (Hide-StoreSecret "the .msix inside the .msixupload is not a zip archive that can be read (the reader's message is not printed)") }
+    if ($man.Count -ne 1) { throw (Hide-StoreSecret "expected one AppxManifest.xml at the root of the .msix, found $($man.Count)") }
+    try {
+      $set = [Xml.XmlReaderSettings]::new()
+      $set.DtdProcessing = [Xml.DtdProcessing]::Prohibit
+      $set.XmlResolver = $null
+      $doc = [Xml.XmlDocument]::new()
+      $doc.XmlResolver = $null
+      $s = $man[0].Open()
+      try {
+        $x = [Xml.XmlReader]::Create($s, $set)
+        try { $doc.Load($x) } finally { $x.Dispose() }
+      } finally { $s.Dispose() }
+    } catch { throw (Hide-StoreSecret "the AppxManifest.xml in the .msix is not XML that can be read (the parser's message is not printed)") }
+    [pscustomobject]@{ MsixName = $msix[0].FullName; MsixLength = $msix[0].Length; Manifest = $doc }
+  } finally {
+    if ($inner) { $inner.Dispose() }
+    if ($msixBytes) { $msixBytes.Dispose() }
+    if ($outer) { $outer.Dispose() }
+  }
 }
 
 # SHA-256 of a file, lower-case hex.
@@ -206,6 +266,21 @@ function Test-StorePlainText([AllowNull()][AllowEmptyString()][string]$Text) {
 # is compared with the Store's, so it is refused, never changed, when not.
 function Test-StorePackageFileName([AllowNull()][AllowEmptyString()][string]$Name) {
   [bool]($Name -and (Test-StorePlainText $Name) -and $Name -cnotmatch '::|##\[')
+}
+
+# Markdown inline code for Text (plain text, Test-StorePlainText), for package
+# text in the job summary. The fence is one backtick longer than the longest
+# run of backticks in Text, so no backtick in Text can end the code span or
+# start another, and when Text starts or ends with a backtick or a space it
+# gets one space inside each end (CommonMark takes one off each end). Inside
+# a code span nothing else is read as Markdown or HTML.
+function Format-StoreMarkdownCode([Parameter(Mandatory)][string]$Text) {
+  if (-not (Test-StorePlainText $Text)) { throw (Hide-StoreSecret "refused: text for the job summary holds a line break or another control character") }
+  $run = 0
+  foreach ($m in [regex]::Matches($Text, '`+')) { $run = [Math]::Max($run, $m.Length) }
+  $fence = '`' * ($run + 1)
+  $pad = if ($Text -cmatch '\A[` ]|[` ]\z') { ' ' } else { '' }
+  "$fence$pad$Text$pad$fence"
 }
 
 # Appends name=value lines to a step output file ($env:GITHUB_OUTPUT).
@@ -696,7 +771,7 @@ function Invoke-StoreHttp {
     [hashtable]$Headers = @{},
     [string]$Body,
     [string]$ContentType,
-    [string]$InFile,
+    [byte[]]$BodyBytes,
     [ValidateRange(1, 3600)][int]$TimeoutSec = 600
   )
   if (-not (Test-StoreUri -Uri $Uri -Kind $Kind)) {
@@ -723,7 +798,7 @@ function Invoke-StoreHttp {
   $client.Timeout = [System.Threading.Timeout]::InfiniteTimeSpan
   $cts = [System.Threading.CancellationTokenSource]::new()
   $req = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::new($Method), $Uri)
-  $file = $null; $resp = $null
+  $resp = $null
   try {
     # Invoke-WebRequest sent a User-Agent; HttpClient sends none by default.
     $req.Headers.Add('User-Agent', 'msstore-submission-action/1.0')
@@ -737,7 +812,7 @@ function Invoke-StoreHttp {
       try { $req.Headers.Add($name, $v) }
       catch { throw (New-StoreError "refused: request header $name has an invalid value (not printed); nothing was sent" -NotSent) }
     }
-    if ($InFile) { $file = [System.IO.File]::OpenRead($InFile); $req.Content = [System.Net.Http.StreamContent]::new($file) }
+    if ($PSBoundParameters.ContainsKey('BodyBytes')) { $req.Content = [System.Net.Http.ByteArrayContent]::new($BodyBytes) }
     elseif ($PSBoundParameters.ContainsKey('Body')) { $req.Content = [System.Net.Http.ByteArrayContent]::new([System.Text.UTF8Encoding]::new($false).GetBytes($Body)) }
     # A change without a body (create, commit, DELETE) is sent with empty
     # content (Content-Length: 0, as Invoke-WebRequest sent it), so
@@ -774,7 +849,6 @@ function Invoke-StoreHttp {
   } finally {
     if ($resp) { $resp.Dispose() }
     $req.Dispose(); $client.Dispose(); $cts.Dispose()
-    if ($file) { $file.Dispose() }
   }
 }
 
@@ -1876,12 +1950,15 @@ function Get-SubmissionUploadUrl([string]$SubmissionJson) {
   $u
 }
 
-# Zips the package (at the zip root, as the CLI does) and PUTs the zip to the
-# submission's SAS upload URL as a block blob. Refuses an upload URL that is
-# not https to a blob storage account (Test-StoreUri Upload) before zipping.
-# The package is opened once: its SHA-256 is taken from that handle and must
-# be ExpectedSha256 (what Get-StorePackage checked), and the zip entry is
-# copied from the same handle, so the bytes sent are the bytes checked.
+# Zips the package (at the zip root, as the CLI does) in memory and PUTs the
+# zip to the submission's SAS upload URL as a block blob. Refuses an upload
+# URL that is not https to a blob storage account (Test-StoreUri Upload)
+# before zipping. The package is read once (Open-StorePackageRead): every
+# byte read goes into the zip entry and into the SHA-256 in the same pass, and
+# the zip is sent only when that SHA-256 is ExpectedSha256 (what
+# Get-StorePackage checked); otherwise nothing is sent. The file is never
+# read again and the zip is never written to disk, so the bytes sent are the
+# bytes hashed, even if the file changes while or after it is read.
 # Prints one fixed line on success; on failure throws fixed text only.
 function Send-StorePackage {
   param([Parameter(Mandatory)][string]$UploadUrl, [Parameter(Mandatory)][string]$PackagePath, [Parameter(Mandatory)][string]$ExpectedSha256)
@@ -1891,42 +1968,44 @@ function Send-StorePackage {
   if (-not (Test-StoreUri -Uri $UploadUrl -Kind Upload)) { throw (Hide-StoreSecret "package upload refused: the upload URL is not $($script:UriRule.Upload); nothing was sent") }
   $name = Split-Path -Leaf $PackagePath
   if (-not (Test-StorePackageFileName $name)) { throw (Hide-StoreSecret "package upload refused: the package file name holds a line break, another control character or workflow command text; nothing was sent") }
-  $work = Join-Path ([IO.Path]::GetTempPath()) ("store-upload-" + [guid]::NewGuid().ToString('N'))
-  New-Item -ItemType Directory $work | Out-Null
+  $zip = [IO.MemoryStream]::new()
+  $hash = [Security.Cryptography.SHA256]::Create()
   try {
-    $zip = Join-Path $work 'Upload.zip'
-    $src = [IO.File]::Open($PackagePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $src = Open-StorePackageRead $PackagePath
     try {
-      $sha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($src)).ToLowerInvariant()
-      if ($sha -cne $ExpectedSha256) { throw (Hide-StoreSecret "package upload refused: the package's SHA-256 is not the one checked before (the file changed since); nothing was sent") }
-      $src.Position = 0
-      $z = [IO.Compression.ZipFile]::Open($zip, [IO.Compression.ZipArchiveMode]::Create)
+      if ($src.Length -gt $script:MaxPackageBytes) { throw (Hide-StoreSecret "package upload refused: the package is larger than $($script:MaxPackageBytes) bytes, the most this action reads; nothing was sent") }
+      $z = [IO.Compression.ZipArchive]::new($zip, [IO.Compression.ZipArchiveMode]::Create, $true)
       try {
-        $entry = $z.CreateEntry($name)
-        $to = $entry.Open()
-        try { $src.CopyTo($to) } finally { $to.Dispose() }
+        $to = $z.CreateEntry($name).Open()
+        try {
+          # Writes each block to the zip entry and adds it to the hash.
+          $both = [Security.Cryptography.CryptoStream]::new($to, $hash, [Security.Cryptography.CryptoStreamMode]::Write, $true)
+          try { $src.CopyTo($both); $both.FlushFinalBlock() } finally { $both.Dispose() }
+        } finally { $to.Dispose() }
       } finally { $z.Dispose() }
     } finally { $src.Dispose() }
-    $len = (Get-Item -LiteralPath $zip).Length
-    # The CLI escapes '+' in the SAS URL the same way before uploading.
-    try {
-      $wait = Get-CallTimeout 600
-      $r = Invoke-StoreHttp -Method PUT -Uri $UploadUrl.Replace('+', '%2B') -Kind Upload -Headers @{ 'x-ms-blob-type' = 'BlockBlob' } -ContentType 'application/zip' -InFile $zip -TimeoutSec $wait
-    } catch { throw (Hide-StoreSecret "package upload failed: $(Get-StoreFailureText $_)") }
-    # Put Blob answers 201 with an empty body once the blob is stored, so 200,
-    # 201 or 204 is success even when the body was lost (BodyLost); an error
-    # status is reported with the fixed BodyLost text when its body was lost.
-    # HTTP 202 or another 2xx (Test-StoreAccepted) does not say the blob is
-    # stored: thrown as accepted, completion unconfirmed, with its status.
-    $lost = Get-StoreBodyLost $r
-    if (Test-StoreAccepted $r.StatusCode) {
-      throw (New-StoreError "package upload answered HTTP $($r.StatusCode): accepted, completion unconfirmed (not confirmed stored)$(if ($lost) { "; $lost" })" -OutcomeUnknown -Status $r.StatusCode)
-    }
-    if ($r.StatusCode -lt 200 -or $r.StatusCode -ge 300) { throw (Hide-StoreSecret "package upload failed: $(Get-StoreErrorText $r.StatusCode $r.Body)$(if ($lost) { "; $lost" })") }
-    Write-StoreHost "package uploaded: $name in Upload.zip ($len bytes), HTTP $($r.StatusCode)$(if ($lost) { " (the answer's body was not read: $lost)" })"
-  } finally {
-    Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    $sha = [Convert]::ToHexString($hash.Hash).ToLowerInvariant()
+  } finally { $hash.Dispose() }
+  if ($sha -cne $ExpectedSha256) { throw (Hide-StoreSecret "package upload refused: the package's SHA-256 is not the one checked before (the file changed since); nothing was sent") }
+  $body = $zip.ToArray()
+  $zip.Dispose()
+  $len = $body.Length
+  # The CLI escapes '+' in the SAS URL the same way before uploading.
+  try {
+    $wait = Get-CallTimeout 600
+    $r = Invoke-StoreHttp -Method PUT -Uri $UploadUrl.Replace('+', '%2B') -Kind Upload -Headers @{ 'x-ms-blob-type' = 'BlockBlob' } -ContentType 'application/zip' -BodyBytes $body -TimeoutSec $wait
+  } catch { throw (Hide-StoreSecret "package upload failed: $(Get-StoreFailureText $_)") }
+  # Put Blob answers 201 with an empty body once the blob is stored, so 200,
+  # 201 or 204 is success even when the body was lost (BodyLost); an error
+  # status is reported with the fixed BodyLost text when its body was lost.
+  # HTTP 202 or another 2xx (Test-StoreAccepted) does not say the blob is
+  # stored: thrown as accepted, completion unconfirmed, with its status.
+  $lost = Get-StoreBodyLost $r
+  if (Test-StoreAccepted $r.StatusCode) {
+    throw (New-StoreError "package upload answered HTTP $($r.StatusCode): accepted, completion unconfirmed (not confirmed stored)$(if ($lost) { "; $lost" })" -OutcomeUnknown -Status $r.StatusCode)
   }
+  if ($r.StatusCode -lt 200 -or $r.StatusCode -ge 300) { throw (Hide-StoreSecret "package upload failed: $(Get-StoreErrorText $r.StatusCode $r.Body)$(if ($lost) { "; $lost" })") }
+  Write-StoreHost "package uploaded: $name in Upload.zip ($len bytes), HTTP $($r.StatusCode)$(if ($lost) { " (the answer's body was not read: $lost)" })"
 }
 
 # POST /applications/{productId}/submissions/{submissionId}/commit: commits
@@ -2291,7 +2370,7 @@ function Publish-StoreSubmission {
   if ((Split-Path -Leaf $PackagePath) -cne $ExpectedFileName) { throw (Hide-StoreSecret "package file is not $ExpectedFileName") }
   if (-not (Test-Path -LiteralPath $PackagePath -PathType Leaf)) { throw (Hide-StoreSecret "package file missing") }
   # The package must still be the one Get-StorePackage checked; Send-StorePackage
-  # checks it again on the handle it uploads from.
+  # checks it again on the bytes it zips, in the same read.
   if ($ExpectedSha256 -cnotmatch '^[0-9a-f]{64}\z') { throw (Hide-StoreSecret "not publishing: the expected SHA-256 is not 64 lower-case hex digits; nothing was sent") }
   if ((Get-StoreFileSha256 $PackagePath) -cne $ExpectedSha256) { throw (Hide-StoreSecret "not publishing: the package's SHA-256 is not the one checked before (the file changed since); nothing was sent") }
   $DeadlineUtc = $DeadlineUtc.ToUniversalTime()
@@ -2637,4 +2716,4 @@ function Remove-StorePendingDraft {
   finally { $script:DeleteOnlyPath = $saved[0]; $script:DeleteOnlySent = $saved[1]; $script:CallDeadline = $saved[2] }
 }
 
-Export-ModuleMember -Function Get-StorePackage, Test-StorePlainText, Test-StorePackageFileName, Write-StoreStepOutput, Protect-StoreText, Test-StoreUri, Invoke-StoreHttp, Protect-WorkflowCommand, Get-ListedTarget, Get-StoreErrorText, Connect-StoreApi, Test-NoPendingSubmission, Read-AppPendingSubmissionId, Assert-NoPendingSubmission, New-StoreSubmission, Test-SubmissionPricing, Set-SubmissionPackage, Get-SubmissionComparedFields, Compare-SubmissionFields, Send-StorePackage, Test-DraftReadyToCommit, Invoke-SubmissionCommit, Remove-StoreDraftSubmission, Publish-StoreSubmission, Test-SubmissionHasPackage, Assert-SubmissionHasPackage, Read-AppLastPublishedSubmissionId, Get-SubmissionDiagnosis, Show-StoreSubmissionDiagnosis, Remove-StorePendingDraft
+Export-ModuleMember -Function Get-StorePackage, Format-StoreMarkdownCode, Test-StorePlainText, Test-StorePackageFileName, Write-StoreStepOutput, Protect-StoreText, Test-StoreUri, Invoke-StoreHttp, Protect-WorkflowCommand, Get-ListedTarget, Get-StoreErrorText, Connect-StoreApi, Test-NoPendingSubmission, Read-AppPendingSubmissionId, Assert-NoPendingSubmission, New-StoreSubmission, Test-SubmissionPricing, Set-SubmissionPackage, Get-SubmissionComparedFields, Compare-SubmissionFields, Send-StorePackage, Test-DraftReadyToCommit, Invoke-SubmissionCommit, Remove-StoreDraftSubmission, Publish-StoreSubmission, Test-SubmissionHasPackage, Assert-SubmissionHasPackage, Read-AppLastPublishedSubmissionId, Get-SubmissionDiagnosis, Show-StoreSubmissionDiagnosis, Remove-StorePendingDraft

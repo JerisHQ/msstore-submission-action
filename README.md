@@ -35,16 +35,24 @@ every call after the create names this run's submission id.
 
 ### The package
 
-The package step reads the `.msixupload` from `package-dir` once: it copies
-it into a new read-only folder under the runner's temp folder, and the
-manifest check, the SHA-256 and the upload all use that copy. The upload
-checks the SHA-256 again on the same open file it zips from, so a file
-replaced in `package-dir` after the check is never what gets uploaded.
+The package step reads the `.msixupload` from `package-dir` once, into
+memory (at most 2,000,000,000 bytes). Its SHA-256, the read-only copy it
+writes to a new folder under the runner's temp folder, and the manifest check
+all come from those bytes, so a file that changes while or after it is read
+cannot pass the check with other content. The upload reads that copy once
+more, in one pass: each block goes into the zip entry and into the SHA-256
+together, and the zip (built in memory, never written to disk) is sent only
+when that SHA-256 is the checked one. On any other, nothing is sent.
 
 A file name or manifest identity field with a line break or another control
 character stops the run before any output is written, and so does a file name
 with workflow command text (`::` or `##[`). Package text the action prints
-has workflow command syntax made inert.
+has workflow command syntax made inert. A package that cannot be unzipped, or
+a manifest that is not XML that can be read (a DTD is refused), stops the run
+with fixed text: the reader's or parser's message, which can quote the
+package, is never printed. The job summary shows the file name, version and
+SHA-256 as Markdown code spans whose backtick fence no backtick in the text
+can close.
 
 ### The publish flow
 

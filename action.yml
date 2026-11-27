@@ -164,9 +164,10 @@ runs:
           @(
             '### Store package'
             ''
-            "- File: ``$($p.FileName)``"
-            "- Version: ``$($p.Version)``"
-            "- SHA-256: ``$($p.Sha256)``"
+            # Code spans whose fence no backtick in the text can end.
+            "- File: $(Format-StoreMarkdownCode $p.FileName)"
+            "- Version: $(Format-StoreMarkdownCode $p.Version)"
+            "- SHA-256: $(Format-StoreMarkdownCode $p.Sha256)"
           ) -join "`n" >> $env:GITHUB_STEP_SUMMARY
         }
 
