@@ -314,9 +314,10 @@ function Read-StorePackageManifest([Parameter(Mandatory)][IO.MemoryStream]$Packa
 # text only) with more than MaxZipEntries entries or a central directory of
 # more than MaxZipDirectoryBytes, before ZipArchive lists its entries. Also
 # refuses, as a zip that cannot be read, one whose central directory
-# Measure-StoreZipDirectory cannot find or whose entry count is not the one
-# its end record gives (ZipArchive refuses that too), so ZipArchive never
-# lists a directory that was not counted here.
+# Measure-StoreZipDirectory cannot find, or could be another one for some
+# .NET version, or whose entry count is not the one its end records give
+# (ZipArchive refuses that too), so ZipArchive never lists a directory that
+# was not counted here.
 function Assert-StoreZipDirectory([Parameter(Mandatory)][IO.Stream]$Zip, [Parameter(Mandatory)][string]$What) {
   $d = $null
   try { $d = Measure-StoreZipDirectory $Zip } catch { $d = $null }
@@ -329,22 +330,39 @@ function Assert-StoreZipDirectory([Parameter(Mandatory)][IO.Stream]$Zip, [Parame
 # Finds a zip's central directory where System.IO.Compression.ZipArchive
 # looks for it (ReadEndOfCentralDirectory, .NET 8 to 11) and walks it the way
 # ZipArchive does the first time its entries are listed. Returns Listed and
-# Declared (the entry count and directory size the end record gives), and
+# Declared (the entry count and directory size the end records give), and
 # Entries and Bytes (the records walked and the bytes they take), or $null
-# when there is no directory to walk.
+# when there is no directory to walk, or when one of those .NET versions
+# could take another end record, locator or directory than this one.
 #
 # The end record is the last "PK 5 6" signature that starts 22 to 65,557
-# bytes before the end of the zip. When its disk number or entry count is
-# 0xFFFF or its directory offset is 0xFFFFFFFF, and the 20 bytes right before
-# it are a zip64 locator, the zip64 end record the locator points to gives the
-# count, size and offset instead. ZipArchive then reads central directory
-# records ("PK 1 2", 46 bytes, then the name, extra field and comment) one
-# after another from that offset until one does not start with that signature
-# or does not fit in the zip; it does not stop at the size the end record
-# gives, so neither does this walk. The walk stops one record past
-# MaxZipEntries, or at the first record that ends past MaxZipDirectoryBytes
-# (then Bytes is where that record ends). Besides the last 65,557 bytes of the
-# zip, it reads 46 bytes a record, holding 46 at a time.
+# bytes before the end of the zip, and its comment must end within the zip.
+# .NET 10 and 11 search those bytes; .NET 8 and 9 search 29 bytes further
+# back, which finds the same last signature, or, when those 65,536 bytes hold
+# none, one this search does not (then $null).
+#
+# When the end record's disk number or entry count is 0xFFFF or its directory
+# offset is 0xFFFFFFFF, ZipArchive looks for a zip64 locator ("PK 6 7"):
+# .NET 10 and 11 only where it ends, 20 bytes before the end record; .NET 8
+# and 9 at any signature starting 20 to 48 bytes before it, the last one. So
+# a locator signature there must start 20 bytes before the end record, with
+# no other there, or the zip gives $null; with none, every version keeps the
+# end record's own fields. The zip64 end record ("PK 6 6") the locator points
+# to then gives the count, size and offset instead, and each field of the end
+# record must be 0xFFFF / 0xFFFFFFFF or the same as in the zip64 end record,
+# as a zip64 writer leaves them, or the zip gives $null.
+#
+# ZipArchive then reads central directory records ("PK 1 2", 46 bytes, then
+# the name, extra field and comment) one after another from that offset until
+# one does not start with that signature; it does not stop at the size the
+# end record gives, so neither does this walk. A record whose 46 bytes are in
+# the zip but whose name, extra field or comment run past its end gives
+# $null: .NET 8 and 9 list it, .NET 10 and 11 stop before it. The walk stops
+# one record past MaxZipEntries, or at the first record that ends past
+# MaxZipDirectoryBytes (then Bytes is where that record ends). Besides the
+# last 65,557 bytes of the zip, it reads the 48 bytes before the end record
+# and the 56 of a zip64 end record, and 46 bytes a record, holding 46 at a
+# time.
 function Measure-StoreZipDirectory([Parameter(Mandatory)][IO.Stream]$Zip) {
   $len = $Zip.Length
   if ($len -lt 22) { return $null }
@@ -357,23 +375,36 @@ function Measure-StoreZipDirectory([Parameter(Mandatory)][IO.Stream]$Zip) {
   if ($at -lt 0) { return $null }
   if ($at + 22 + [BitConverter]::ToUInt16($tail, $at + 20) -gt $tailLen) { return $null }
   $endAt = $len - $tailLen + $at
-  $disk = [BitConverter]::ToUInt16($tail, $at + 4)
-  [uint64]$listed = [BitConverter]::ToUInt16($tail, $at + 10)
-  [uint64]$declared = [BitConverter]::ToUInt32($tail, $at + 12)
-  [uint64]$start = [BitConverter]::ToUInt32($tail, $at + 16)
+  # The end record's disk number, disk number of the directory, entry counts
+  # on this disk and in all, directory size and directory offset.
+  $end = @([BitConverter]::ToUInt16($tail, $at + 4), [BitConverter]::ToUInt16($tail, $at + 6),
+    [BitConverter]::ToUInt16($tail, $at + 8), [BitConverter]::ToUInt16($tail, $at + 10),
+    [BitConverter]::ToUInt32($tail, $at + 12), [BitConverter]::ToUInt32($tail, $at + 16))
+  [uint64]$listed = $end[3]; [uint64]$declared = $end[4]; [uint64]$start = $end[5]
   # [uint16]::MaxValue and [uint32]::MaxValue: in PowerShell 0xFFFFFFFF is the
   # Int32 -1, which no [uint64] equals.
-  if (($disk -eq [uint16]::MaxValue -or $listed -eq [uint16]::MaxValue -or $start -eq [uint32]::MaxValue) -and $endAt -ge 20) {
-    $loc = Read-StoreZipBytes $Zip ($endAt - 20) 20
-    if ($loc[0] -eq 0x50 -and $loc[1] -eq 0x4B -and $loc[2] -eq 6 -and $loc[3] -eq 7) {
-      $recAt = [BitConverter]::ToUInt64($loc, 8)
+  if ($end[0] -eq [uint16]::MaxValue -or $end[3] -eq [uint16]::MaxValue -or $end[5] -eq [uint32]::MaxValue) {
+    if ($endAt -lt 20) { return $null }
+    $winAt = [Math]::Max(0, $endAt - 48)
+    $win = Read-StoreZipBytes $Zip $winAt ([int]($endAt - $winAt))
+    # Only signatures that start at least 20 bytes before the end record; the
+    # first one found must be the one that starts exactly 20 bytes before it.
+    $loc = [Text.Encoding]::Latin1.GetString($win, 0, $win.Length - 16).IndexOf("PK$([char]6)$([char]7)", [StringComparison]::Ordinal)
+    if ($loc -ge 0) {
+      if ($loc -ne $win.Length - 20) { return $null }
+      $recAt = [BitConverter]::ToUInt64($win, $loc + 8)
       if ($len -lt 56 -or $recAt -gt [uint64]($len - 56)) { return $null }
       $rec = Read-StoreZipBytes $Zip ([long]$recAt) 56
       if (-not ($rec[0] -eq 0x50 -and $rec[1] -eq 0x4B -and $rec[2] -eq 6 -and $rec[3] -eq 6)) { return $null }
-      $listed = [BitConverter]::ToUInt64($rec, 32)
-      if ($listed -ne [BitConverter]::ToUInt64($rec, 24)) { return $null }
-      $declared = [BitConverter]::ToUInt64($rec, 40)
-      $start = [BitConverter]::ToUInt64($rec, 48)
+      $z64 = @([BitConverter]::ToUInt32($rec, 16), [BitConverter]::ToUInt32($rec, 20),
+        [BitConverter]::ToUInt64($rec, 24), [BitConverter]::ToUInt64($rec, 32),
+        [BitConverter]::ToUInt64($rec, 40), [BitConverter]::ToUInt64($rec, 48))
+      if ($z64[2] -ne $z64[3]) { return $null }
+      for ($k = 0; $k -lt 6; $k++) {
+        $mask = if ($k -lt 4) { [uint64][uint16]::MaxValue } else { [uint64][uint32]::MaxValue }
+        if ([uint64]$end[$k] -ne $mask -and [uint64]$end[$k] -ne $z64[$k]) { return $null }
+      }
+      $listed = $z64[3]; $declared = $z64[4]; $start = $z64[5]
     }
   }
   if ($start -gt [uint64]$len) { return $null }
@@ -388,7 +419,7 @@ function Measure-StoreZipDirectory([Parameter(Mandatory)][IO.Stream]$Zip) {
     $Zip.ReadExactly($head, 0, 46)
     if (-not ($head[0] -eq 0x50 -and $head[1] -eq 0x4B -and $head[2] -eq 1 -and $head[3] -eq 2)) { break }
     $next = $p + 46 + [BitConverter]::ToUInt16($head, 28) + [BitConverter]::ToUInt16($head, 30) + [BitConverter]::ToUInt16($head, 32)
-    if ($next -gt $avail) { break }
+    if ($next -gt $avail) { return $null }
     $p = $next; $n++
     if ($p -gt $max -or $n -gt $script:MaxZipEntries) { break }
   }

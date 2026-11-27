@@ -919,10 +919,10 @@ Describe 'Package size limits (every read counted as it goes)' {
     # the size that entry's zip records give instead of its own. OuterExtra,
     # InnerExtra: that many more one-byte entries (Extra1.bin, ...) at the
     # root of the .msixupload, or of the .msix. Zip64: both zips end with zip64
-    # end records (ConvertTo-Zip64Bytes). Returns the path.
+    # end records (ConvertTo-Zip64Bytes, with Zip64Masked). Returns the path.
     function script:New-SizedPackage {
       param([int]$ManifestSize = 0, [int]$Fill = 0, [switch]$Random, [string[]]$Stored = @(), [long]$MsixSays = -1, [long]$ManifestSays = -1,
-        [int]$OuterExtra = 0, [int]$InnerExtra = 0, [switch]$Zip64)
+        [int]$OuterExtra = 0, [int]$InnerExtra = 0, [switch]$Zip64, [string]$Zip64Masked = 'CountsSizeOffset')
       $head = '<?xml version="1.0" encoding="utf-8"?><Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">' +
         '<Identity Name="Contoso.ExampleApp" Publisher="CN=00000000-0000-0000-0000-000000000000" Version="0.4.1.0" ProcessorArchitecture="x64" />'
       $text = if ($ManifestSize) { $head + '<!--' + ('x' * ($ManifestSize - $head.Length - '<!---->'.Length - '</Package>'.Length)) + '--></Package>' } else { $head + '</Package>' }
@@ -934,12 +934,12 @@ Describe 'Package size limits (every read counted as it goes)' {
       for ($k = 1; $k -le $InnerExtra; $k++) { $entries += @{ Name = "Extra$k.bin"; Bytes = [byte[]]@(1); Stored = $true } }
       $inner = New-ZipBytes $entries
       if ($ManifestSays -ge 0) { Set-ZipEntrySize $inner 'AppxManifest.xml' $ManifestSays }
-      if ($Zip64) { $inner = ConvertTo-Zip64Bytes $inner }
+      if ($Zip64) { $inner = ConvertTo-Zip64Bytes $inner $Zip64Masked }
       $entries = @(@{ Name = 'ExampleApp.msix'; Bytes = $inner; Stored = $Stored -contains 'msix' })
       for ($k = 1; $k -le $OuterExtra; $k++) { $entries += @{ Name = "Extra$k.bin"; Bytes = [byte[]]@(1); Stored = $true } }
       $outer = New-ZipBytes $entries
       if ($MsixSays -ge 0) { Set-ZipEntrySize $outer 'ExampleApp.msix' $MsixSays }
-      if ($Zip64) { $outer = ConvertTo-Zip64Bytes $outer }
+      if ($Zip64) { $outer = ConvertTo-Zip64Bytes $outer $Zip64Masked }
       $p = Join-Path $Dir $File
       [IO.File]::WriteAllBytes($p, $outer)
       $p
@@ -964,8 +964,12 @@ Describe 'Package size limits (every read counted as it goes)' {
     # The 98 bytes that end a zip whose end record leaves its entry count,
     # directory size and offset to a zip64 end record: the zip64 end record
     # (at RecordAt, giving Listed, Declared and Start), its locator, and an end
-    # record whose counts are 0xFFFF and size and offset 0xFFFFFFFF.
-    function script:Get-Zip64EndBytes([uint64]$Listed, [uint64]$Declared, [uint64]$Start, [uint64]$RecordAt) {
+    # record. Masked says which end record fields are 0xFFFF / 0xFFFFFFFF, the
+    # others giving what the zip64 end record gives: CountsSizeOffset (its disk
+    # numbers 0), as MSIX packaging tools end a .msix; All, its disk numbers
+    # too, as the JerisLink 0.2.0.0 .msix ends; Offset, only the offset.
+    function script:Get-Zip64EndBytes([uint64]$Listed, [uint64]$Declared, [uint64]$Start, [uint64]$RecordAt,
+      [ValidateSet('CountsSizeOffset', 'All', 'Offset')][string]$Masked = 'CountsSizeOffset') {
       $b = [byte[]]::new(98)
       ([byte[]](0x50, 0x4B, 6, 6)).CopyTo($b, 0)
       [BitConverter]::GetBytes([uint64]44).CopyTo($b, 4)
@@ -975,17 +979,21 @@ Describe 'Package size limits (every read counted as it goes)' {
       ([byte[]](0x50, 0x4B, 6, 7)).CopyTo($b, 56)
       [BitConverter]::GetBytes($RecordAt).CopyTo($b, 64); [BitConverter]::GetBytes([uint32]1).CopyTo($b, 72)
       ([byte[]](0x50, 0x4B, 5, 6)).CopyTo($b, 76)
-      [BitConverter]::GetBytes([uint16]::MaxValue).CopyTo($b, 84); [BitConverter]::GetBytes([uint16]::MaxValue).CopyTo($b, 86)
-      [BitConverter]::GetBytes([uint32]::MaxValue).CopyTo($b, 88); [BitConverter]::GetBytes([uint32]::MaxValue).CopyTo($b, 92)
+      if ($Masked -ceq 'All') { [BitConverter]::GetBytes([uint16]::MaxValue).CopyTo($b, 80); [BitConverter]::GetBytes([uint16]::MaxValue).CopyTo($b, 82) }
+      [uint16]$count = if ($Masked -ceq 'Offset') { $Listed } else { [uint16]::MaxValue }
+      [uint32]$size = if ($Masked -ceq 'Offset') { $Declared } else { [uint32]::MaxValue }
+      [BitConverter]::GetBytes($count).CopyTo($b, 84); [BitConverter]::GetBytes($count).CopyTo($b, 86)
+      [BitConverter]::GetBytes($size).CopyTo($b, 88); [BitConverter]::GetBytes([uint32]::MaxValue).CopyTo($b, 92)
       , $b
     }
     # Zip (a zip New-ZipBytes wrote) ending the way MSIX packaging tools end a
-    # .msix: zip64 end records give its entry count, directory size and offset.
-    function script:ConvertTo-Zip64Bytes([byte[]]$Zip) {
+    # .msix: zip64 end records give its entry count, directory size and offset
+    # (Masked: as for Get-Zip64EndBytes).
+    function script:ConvertTo-Zip64Bytes([byte[]]$Zip, [string]$Masked = 'CountsSizeOffset') {
       $end = $Zip.Length - 22
       $ms = [IO.MemoryStream]::new()
       $ms.Write($Zip, 0, $end)
-      $tail = Get-Zip64EndBytes ([BitConverter]::ToUInt16($Zip, $end + 10)) ([BitConverter]::ToUInt32($Zip, $end + 12)) ([BitConverter]::ToUInt32($Zip, $end + 16)) $end
+      $tail = Get-Zip64EndBytes ([BitConverter]::ToUInt16($Zip, $end + 10)) ([BitConverter]::ToUInt32($Zip, $end + 12)) ([BitConverter]::ToUInt32($Zip, $end + 16)) $end $Masked
       $ms.Write($tail, 0, $tail.Length)
       , $ms.ToArray()
     }
@@ -1012,6 +1020,50 @@ Describe 'Package size limits (every read counted as it goes)' {
       }
       $ms.Write($end, 0, $end.Length)
       , $ms.ToArray()
+    }
+    # A zip that is only two central directories, B and A, and the records
+    # that end it: B at offset 0, Count records named b.bin (46 bytes and the
+    # name), 4 zero bytes, A, one record named a.bin, 4 zero bytes, a zip64 end
+    # record giving B, Gap zero bytes, a zip64 locator pointing to that record
+    # that starts LocatorAt bytes before the end record, zeros up to the end
+    # record, and an end
+    # record giving A (1 entry, 51 bytes, at its offset) whose disk numbers are
+    # 0xFFFF, so ZipArchive looks for a locator; with Masked, an end record
+    # whose every field is 0xFFFF / 0xFFFFFFFF instead. SignatureAt: also a
+    # locator signature ("PK 6 7") that many bytes before the end record.
+    function script:New-TwoDirectoryZipBytes([int]$Count = 9, [int]$LocatorAt = 20, [int]$Gap = 0, [int]$SignatureAt = 0, [switch]$Masked) {
+      $ms = [IO.MemoryStream]::new()
+      foreach ($k in 1..($Count + 1)) {
+        if ($k -eq $Count + 1) { $ms.Write([byte[]]::new(4), 0, 4); $atA = $ms.Length }
+        $r = [byte[]]::new(51)
+        ([byte[]](0x50, 0x4B, 1, 2)).CopyTo($r, 0); [BitConverter]::GetBytes([uint16]5).CopyTo($r, 28)
+        [Text.Encoding]::ASCII.GetBytes($(if ($k -le $Count) { 'b.bin' } else { 'a.bin' })).CopyTo($r, 46)
+        $ms.Write($r, 0, 51)
+      }
+      $ms.Write([byte[]]::new(4), 0, 4)
+      $tail = Get-Zip64EndBytes $Count (51 * $Count) 0 $ms.Length
+      $ms.Write($tail, 0, 56)
+      $ms.Write([byte[]]::new($Gap), 0, $Gap)
+      $ms.Write($tail, 56, 20)
+      $ms.Write([byte[]]::new($LocatorAt - 20), 0, $LocatorAt - 20)
+      if (-not $Masked) {
+        [BitConverter]::GetBytes([uint16]1).CopyTo($tail, 84); [BitConverter]::GetBytes([uint16]1).CopyTo($tail, 86)
+        [BitConverter]::GetBytes([uint32]51).CopyTo($tail, 88); [BitConverter]::GetBytes([uint32]$atA).CopyTo($tail, 92)
+      }
+      [BitConverter]::GetBytes([uint16]::MaxValue).CopyTo($tail, 80); [BitConverter]::GetBytes([uint16]::MaxValue).CopyTo($tail, 82)
+      $ms.Write($tail, 76, 22)
+      $z = $ms.ToArray()
+      if ($SignatureAt) { ([byte[]](0x50, 0x4B, 6, 7)).CopyTo($z, $z.Length - 22 - $SignatureAt) }
+      , $z
+    }
+    # The names of the entries ZipArchive lists in Zip, on this .NET.
+    function script:Get-ZipEntryNames([byte[]]$Zip) {
+      $z = [IO.Compression.ZipArchive]::new([IO.MemoryStream]::new($Zip), [IO.Compression.ZipArchiveMode]::Read)
+      try { @($z.Entries.FullName) } finally { $z.Dispose() }
+    }
+    # What Measure-StoreZipDirectory gives for Zip.
+    function script:Measure-ZipBytes([byte[]]$Zip) {
+      & (Get-Module MsStoreRunner) { param($s) Measure-StoreZipDirectory $s } ([IO.MemoryStream]::new($Zip))
     }
     $script:UploadUrl = 'https://fakeupload.blob.core.windows.net/blob/upload.zip?sv=1&sig=FAKE%2BSAS'
     # Runs Command twice and returns what the second run returned (Value) and
@@ -1247,14 +1299,18 @@ Describe 'Package size limits (every read counted as it goes)' {
     $r.Err | Should -BeExactly 'the .msixupload has a zip central directory of more than 16777216 bytes, the most this action reads'
     @(Get-ChildItem -LiteralPath $Tmp).Count | Should -Be 0 -Because 'no copy is kept'
   }
-  It 'reads a package whose .msixupload and .msix end with zip64 end records, as MSIX packaging tools end a .msix' {
-    $p = New-SizedPackage -Zip64 -OuterExtra 2 -InnerExtra 2
+  It 'reads a package whose .msixupload and .msix end with zip64 end records and an end record <Case>' -ForEach @(
+    @{ Case = 'whose disk numbers are 0 and other fields 0xFFFF / 0xFFFFFFFF, as MSIX packaging tools end a .msix'; Masked = 'CountsSizeOffset' }
+    @{ Case = 'whose every field is 0xFFFF / 0xFFFFFFFF, as the JerisLink 0.2.0.0 .msix ends'; Masked = 'All' }
+    @{ Case = 'that gives its own entry count and size and leaves only the offset to the zip64 end record'; Masked = 'Offset' }
+  ) {
+    $p = New-SizedPackage -Zip64 -Zip64Masked $Masked -OuterExtra 2 -InnerExtra 2
     $r = Invoke-Captured { Get-Package }
     $r.Err | Should -BeNullOrEmpty
     $r.Value[-1].Version | Should -BeExactly '0.4.1.0'
     foreach ($zip in @(, [IO.File]::ReadAllBytes($p)) + @(, (Get-MsixBytes $p))) {
       [BitConverter]::ToUInt32($zip, $zip.Length - 6) | Should -Be ([uint32]::MaxValue) -Because 'the end record leaves the offset to the zip64 end record'
-      $d = & (Get-Module MsStoreRunner) { param($z) Measure-StoreZipDirectory $z } ([IO.MemoryStream]::new($zip))
+      $d = Measure-ZipBytes $zip
       $d.Entries | Should -Be 3
       $d.Listed | Should -Be 3
       $d.Bytes | Should -Be $d.Declared
@@ -1268,6 +1324,72 @@ Describe 'Package size limits (every read counted as it goes)' {
     [IO.File]::WriteAllBytes((Join-Path $Dir $File), $bytes)
     $r = Invoke-Captured { Get-Package }
     $r.Err | Should -BeExactly "the .msixupload is not a zip archive that can be read (the reader's message is not printed)"
+  }
+  # A zip64 locator 21 to 48 bytes before the end record, none 20 before:
+  # .NET 8 and 9 take it and list B, the directory its zip64 end record
+  # gives; .NET 10 and 11 look only 20 bytes before and list A, the one the
+  # end record gives. A check that counted only A would let B, over
+  # MaxZipEntries, be listed on .NET 8 and 9.
+  It 'refuses, as a zip that cannot be read, <What> with a zip64 locator <LocatorAt> bytes before its end record, where .NET 8 and 9 list a central directory of 9 entries (over MaxZipEntries, here 8) that its end record does not give' -ForEach @(
+    @{ What = 'a .msixupload'; Inner = $false; LocatorAt = 21 }
+    @{ What = 'a .msixupload'; Inner = $false; LocatorAt = 24 }
+    @{ What = 'a .msixupload'; Inner = $false; LocatorAt = 48 }
+    @{ What = 'the .msix inside a .msixupload'; Inner = $true; LocatorAt = 21 }
+    @{ What = 'the .msix inside a .msixupload'; Inner = $true; LocatorAt = 48 }
+  ) {
+    Set-ZipLimits 8 $SavedZipLimits[1]
+    $bad = New-TwoDirectoryZipBytes -Count 9 -LocatorAt $LocatorAt
+    $listed = Get-ZipEntryNames $bad
+    if ([Environment]::Version.Major -lt 10) { $listed | Should -BeExactly (@('b.bin') * 9) -Because '.NET 8 and 9 take the locator and list B' }
+    else { $listed | Should -BeExactly @('a.bin') -Because '.NET 10 and later look for a locator only 20 bytes before the end record and list A' }
+    $bytes = if ($Inner) { New-ZipBytes @(@{ Name = 'ExampleApp.msix'; Bytes = $bad }) } else { $bad }
+    [IO.File]::WriteAllBytes((Join-Path $Dir $File), $bytes)
+    $r = Invoke-Captured { Get-Package }
+    $want = if ($Inner) { $UnpackError } else { "the .msixupload is not a zip archive that can be read (the reader's message is not printed)" }
+    $r.Err | Should -BeExactly $want
+    @(Get-ChildItem -LiteralPath $Tmp).Count | Should -Be 0 -Because 'no copy is kept'
+  }
+  It 'measures the central directory of a zip with a zip64 locator 20 bytes before its end record (<Gap> bytes after its zip64 end record), or none 20 to 48 bytes before, as every .NET lists it' -ForEach @(
+    @{ Gap = 0 }
+    @{ Gap = 28 }
+  ) {
+    $z = New-TwoDirectoryZipBytes -Count 9 -LocatorAt 20 -Gap $Gap -Masked
+    (Get-ZipEntryNames $z) | Should -BeExactly (@('b.bin') * 9)
+    $d = Measure-ZipBytes $z
+    $d.Listed | Should -Be 9
+    $d.Entries | Should -Be 9
+    $z = New-TwoDirectoryZipBytes -Count 9 -LocatorAt 49
+    (Get-ZipEntryNames $z) | Should -BeExactly @('a.bin')
+    $d = Measure-ZipBytes $z
+    $d.Listed | Should -Be 1
+    $d.Entries | Should -Be 1
+  }
+  It 'refuses, as a zip that cannot be read, a .msixupload <Case>' -ForEach @(
+    @{ Case = 'with a zip64 locator 20 bytes before its end record and another locator signature 40 bytes before'
+      Zip = { New-TwoDirectoryZipBytes -Gap 28 -SignatureAt 40 -Masked } }
+    @{ Case = 'with a zip64 locator 20 bytes before its end record and another locator signature 48 bytes before'
+      Zip = { New-TwoDirectoryZipBytes -Gap 28 -SignatureAt 48 -Masked } }
+    @{ Case = 'whose end record gives A, 1 entry at its offset, and its zip64 end record B, 9 entries at offset 0'
+      Zip = { New-TwoDirectoryZipBytes -LocatorAt 20 } }
+    @{ Case = 'whose end record gives 2 entries and its zip64 end record 3'
+      Zip = { $z = New-ZipDirectoryBytes -Count 3 -Zip64; ([byte[]](2, 0, 2, 0)).CopyTo($z, $z.Length - 14); , $z } }
+    @{ Case = 'whose end record gives a central directory of 152 bytes and its zip64 end record 153'
+      Zip = { $z = New-ZipDirectoryBytes -Count 3 -Zip64; [BitConverter]::GetBytes([uint32]152).CopyTo($z, $z.Length - 10); , $z } }
+    @{ Case = 'whose end record gives its central directory at offset 1 and its zip64 end record at 0'
+      Zip = { $z = New-ZipDirectoryBytes -Count 3 -Zip64; [BitConverter]::GetBytes([uint32]1).CopyTo($z, $z.Length - 6); , $z } }
+    @{ Case = 'whose zip64 end record gives 3 entries on this disk and 4 in all'
+      Zip = { $z = New-ZipDirectoryBytes -Count 3 -Zip64; [BitConverter]::GetBytes([uint64]4).CopyTo($z, $z.Length - 66); , $z } }
+    @{ Case = 'whose zip64 locator points 1 byte past its zip64 end record'
+      Zip = { $z = New-ZipDirectoryBytes -Count 3 -Zip64; [BitConverter]::GetBytes([uint64]154).CopyTo($z, $z.Length - 34); , $z } }
+    @{ Case = 'whose end record, 10 bytes into the file, gives its disk numbers as 0xFFFF'
+      Zip = { $z = [byte[]]::new(32); ([byte[]](0x50, 0x4B, 5, 6, 0xFF, 0xFF, 0xFF, 0xFF)).CopyTo($z, 10); , $z } }
+    @{ Case = 'whose last central directory record has a name that runs past the end of the file'
+      Zip = { $z = New-ZipDirectoryBytes -Count 2; [BitConverter]::GetBytes([uint16]200).CopyTo($z, 51 + 28); , $z } }
+  ) {
+    [IO.File]::WriteAllBytes((Join-Path $Dir $File), (& $Zip))
+    $r = Invoke-Captured { Get-Package }
+    $r.Err | Should -BeExactly "the .msixupload is not a zip archive that can be read (the reader's message is not printed)"
+    @(Get-ChildItem -LiteralPath $Tmp).Count | Should -Be 0 -Because 'no copy is kept'
   }
 }
 
