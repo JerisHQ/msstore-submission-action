@@ -21,6 +21,21 @@ version, SHA-256    ----->  -> PUT packages -> upload -> GET + field compare
 It is a composite action written in PowerShell 7 (`scripts/MsStoreRunner.psm1`),
 with a Pester test suite and a fake Store API that runs on 127.0.0.1.
 
+## How it differs
+
+- [`microsoft/microsoft-store-apppublisher`](https://github.com/microsoft/microsoft-store-apppublisher)
+  sets up the `msstore` CLI, and your workflow writes the publish steps with
+  it; `msstore publish --noCommit` skips the commit, so the submission stays an
+  uncommitted draft. This action's `publish` mode goes from create to commit,
+  then reads the submission back (see [Why not the Store CLI](#why-not-the-store-cli)).
+- A `publish` run only updates and commits the submission it creates. If the app
+  already has a pending submission, it stops and leaves that one alone.
+- Before the commit it compares the submission's fields. `inspect` shows the
+  package's SHA-256 for the reviewer to check before approving `publish`, and
+  `diagnose` and `delete-draft` deal with a draft a failed run left behind.
+- No third-party service: it signs in with your own Entra ID app and calls the
+  Microsoft Store submission API directly (see [Secrets](#secrets)).
+
 ## Before you start
 
 - [ ] A Microsoft Entra ID app registration with a client secret. Its tenant
